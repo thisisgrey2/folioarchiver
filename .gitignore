@@ -1,0 +1,6 @@
+.DS_Store
+FolioScraper/.venv/
+FolioScraper/.build/
+FolioScraper/build/
+FolioScraper/dist/
+FolioScraper/tmp-normalized-check/
