@@ -46,6 +46,8 @@ private struct AssetResponse {
 }
 
 private struct ImageFingerprint {
+    let structureHash: UInt64
+    let colorSignature: [UInt8]
     let redHash: UInt64
     let greenHash: UInt64
     let blueHash: UInt64
@@ -69,6 +71,20 @@ private struct DownloadedImagePayload {
     let height: Int
     let fingerprint: ImageFingerprint?
     let destinationDirectory: URL
+}
+
+private enum MediaKind {
+    case image
+    case video
+
+    var folderName: String {
+        switch self {
+        case .image:
+            return "Images"
+        case .video:
+            return "Videos"
+        }
+    }
 }
 
 public actor PortfolioScraperService {
@@ -898,12 +914,21 @@ public actor PortfolioScraperService {
         var skippedLarge = 0
         var errors = 0
 
-        func persistImage(_ image: DownloadedImagePayload) throws -> URL {
+        func persistImage(_ image: DownloadedImagePayload, duplicateOutcome: String) throws -> URL {
             guard !image.data.isEmpty else {
                 throw PortfolioScraperError.emptyAsset(url: nil)
             }
             try FileManager.default.createDirectory(at: image.destinationDirectory, withIntermediateDirectories: true)
-            let fileURL = try uniqueOutputURL(in: image.destinationDirectory, preferredName: image.preferredName)
+            let preferredName = if image.fingerprint != nil {
+                filenameByAppendingDoneMarker(
+                    to: image.preferredName,
+                    checkForDuplicates: checkForDuplicates,
+                    duplicateOutcome: duplicateOutcome
+                )
+            } else {
+                image.preferredName
+            }
+            let fileURL = try uniqueOutputURL(in: image.destinationDirectory, preferredName: preferredName)
             try Task.checkCancellation()
             try image.data.write(to: fileURL)
             return fileURL
@@ -939,24 +964,34 @@ public actor PortfolioScraperService {
                         let fileURL: URL?
 
                         if checkForDuplicates,
-                           let fingerprint = image.fingerprint,
-                           let duplicateIndex = savedImageRecords.firstIndex(where: { isNearDuplicate(fingerprint, $0.fingerprint) }) {
-                            let existing = savedImageRecords[duplicateIndex]
-                            if fingerprint.pixelArea > existing.fingerprint.pixelArea {
-                                try FileManager.default.removeItem(at: existing.fileURL)
-                                let replacementURL = try persistImage(image)
-                                if let downloadedIndex = downloaded.firstIndex(of: existing.fileURL) {
-                                    downloaded[downloadedIndex] = replacementURL
-                                } else {
-                                    downloaded.append(replacementURL)
-                                }
-                                savedImageRecords[duplicateIndex] = SavedImageRecord(fileURL: replacementURL, fingerprint: fingerprint)
-                                fileURL = replacementURL
-                            } else {
+                           let fingerprint = image.fingerprint {
+                            let duplicateIndexes = savedImageRecords.indices.filter {
+                                isNearDuplicate(fingerprint, savedImageRecords[$0].fingerprint)
+                            }
+
+                            if duplicateIndexes.isEmpty {
+                                let savedURL = try persistImage(image, duplicateOutcome: "NOMATCH")
+                                downloaded.append(savedURL)
+                                savedImageRecords.append(SavedImageRecord(fileURL: savedURL, fingerprint: fingerprint))
+                                fileURL = savedURL
+                            } else if duplicateIndexes.contains(where: { savedImageRecords[$0].fingerprint.pixelArea >= fingerprint.pixelArea }) {
                                 fileURL = nil
+                            } else {
+                                let duplicateURLs = Set(duplicateIndexes.map { savedImageRecords[$0].fileURL })
+                                for url in duplicateURLs where FileManager.default.fileExists(atPath: url.path) {
+                                    try FileManager.default.removeItem(at: url)
+                                }
+
+                                downloaded.removeAll { duplicateURLs.contains($0) }
+                                savedImageRecords.removeAll { duplicateURLs.contains($0.fileURL) }
+
+                                let replacementURL = try persistImage(image, duplicateOutcome: "REPLACE")
+                                downloaded.append(replacementURL)
+                                savedImageRecords.append(SavedImageRecord(fileURL: replacementURL, fingerprint: fingerprint))
+                                fileURL = replacementURL
                             }
                         } else {
-                            let savedURL = try persistImage(image)
+                            let savedURL = try persistImage(image, duplicateOutcome: "NOMATCH")
                             downloaded.append(savedURL)
                             if let fingerprint = image.fingerprint {
                                 savedImageRecords.append(SavedImageRecord(fileURL: savedURL, fingerprint: fingerprint))
@@ -1032,7 +1067,8 @@ public actor PortfolioScraperService {
                 destinationDirectory: sourceDirectory(
                     for: candidate.referer,
                     in: outputDirectory,
-                    organizeImagesBySourcePage: organizeImagesBySourcePage
+                    organizeImagesBySourcePage: organizeImagesBySourcePage,
+                    mediaKind: .image
                 )
             )
         )
@@ -1066,7 +1102,8 @@ public actor PortfolioScraperService {
         let destinationDirectory = sourceDirectory(
             for: candidate.referer,
             in: outputDirectory,
-            organizeImagesBySourcePage: organizeImagesBySourcePage
+            organizeImagesBySourcePage: organizeImagesBySourcePage,
+            mediaKind: .video
         )
         try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
         let fileURL = try uniqueOutputURL(
@@ -1308,11 +1345,15 @@ public actor PortfolioScraperService {
 
     private func imageFingerprint(for image: CGImage) -> ImageFingerprint? {
         guard let normalizedImage = normalizedBitmapImage(from: image),
-              let colorHash = perceptualColorHash(for: normalizedImage) else {
+              let structureHash = perceptualDifferenceHash(for: normalizedImage),
+              let colorHash = perceptualColorHash(for: normalizedImage),
+              let colorSignature = coarseColorSignature(for: normalizedImage) else {
             return nil
         }
 
         return ImageFingerprint(
+            structureHash: structureHash,
+            colorSignature: colorSignature,
             redHash: colorHash.red,
             greenHash: colorHash.green,
             blueHash: colorHash.blue,
@@ -1342,17 +1383,16 @@ public actor PortfolioScraperService {
         return context.makeImage()
     }
 
-    private func perceptualColorHash(for image: CGImage) -> (red: UInt64, green: UInt64, blue: UInt64)? {
-        let sampleSize = 8
+    private func sampledPixels(for image: CGImage, width: Int, height: Int) -> [UInt8]? {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        var pixels = [UInt8](repeating: 0, count: sampleSize * sampleSize * 4)
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
 
         guard let context = CGContext(
             data: &pixels,
-            width: sampleSize,
-            height: sampleSize,
+            width: width,
+            height: height,
             bitsPerComponent: 8,
-            bytesPerRow: sampleSize * 4,
+            bytesPerRow: width * 4,
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
@@ -1360,7 +1400,70 @@ public actor PortfolioScraperService {
         }
 
         context.interpolationQuality = .low
-        context.draw(image, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return pixels
+    }
+
+    private func perceptualDifferenceHash(for image: CGImage) -> UInt64? {
+        let width = 9
+        let height = 8
+
+        guard let pixels = sampledPixels(for: image, width: width, height: height) else {
+            return nil
+        }
+
+        var hash: UInt64 = 0
+        var bitIndex: UInt64 = 0
+
+        for row in 0..<height {
+            for column in 0..<(width - 1) {
+                let leftIndex = (row * width + column) * 4
+                let rightIndex = (row * width + column + 1) * 4
+
+                let left = luminance(
+                    red: pixels[leftIndex],
+                    green: pixels[leftIndex + 1],
+                    blue: pixels[leftIndex + 2]
+                )
+                let right = luminance(
+                    red: pixels[rightIndex],
+                    green: pixels[rightIndex + 1],
+                    blue: pixels[rightIndex + 2]
+                )
+
+                if left >= right {
+                    hash |= UInt64(1) << bitIndex
+                }
+                bitIndex += 1
+            }
+        }
+
+        return hash
+    }
+
+    private func coarseColorSignature(for image: CGImage) -> [UInt8]? {
+        let sampleSize = 4
+        guard let pixels = sampledPixels(for: image, width: sampleSize, height: sampleSize) else {
+            return nil
+        }
+
+        var signature: [UInt8] = []
+        signature.reserveCapacity(sampleSize * sampleSize * 3)
+
+        for index in stride(from: 0, to: pixels.count, by: 4) {
+            signature.append(pixels[index])
+            signature.append(pixels[index + 1])
+            signature.append(pixels[index + 2])
+        }
+
+        return signature
+    }
+
+    private func perceptualColorHash(for image: CGImage) -> (red: UInt64, green: UInt64, blue: UInt64)? {
+        let sampleSize = 8
+        guard let pixels = sampledPixels(for: image, width: sampleSize, height: sampleSize) else {
+            return nil
+        }
 
         var redValues: [UInt8] = []
         var greenValues: [UInt8] = []
@@ -1394,14 +1497,43 @@ public actor PortfolioScraperService {
     }
 
     private func isNearDuplicate(_ lhs: ImageFingerprint, _ rhs: ImageFingerprint) -> Bool {
+        let redHashThreshold = 12
+        let greenHashThreshold = 20
+        let blueHashThreshold = 10
+        let structureThreshold = 22
+        let colorThreshold = 66
+
         let redDistance = hammingDistance(lhs.redHash, rhs.redHash)
         let greenDistance = hammingDistance(lhs.greenHash, rhs.greenHash)
         let blueDistance = hammingDistance(lhs.blueHash, rhs.blueHash)
-        return redDistance <= 8 && greenDistance <= 8 && blueDistance <= 8
+        if redDistance <= redHashThreshold &&
+            greenDistance <= greenHashThreshold &&
+            blueDistance <= blueHashThreshold {
+            return true
+        }
+
+        let structureDistance = hammingDistance(lhs.structureHash, rhs.structureHash)
+        let colorDistance = averageColorDistance(lhs.colorSignature, rhs.colorSignature)
+        return structureDistance <= structureThreshold && colorDistance <= colorThreshold
     }
 
     private func hammingDistance(_ lhs: UInt64, _ rhs: UInt64) -> Int {
         Int((lhs ^ rhs).nonzeroBitCount)
+    }
+
+    private func averageColorDistance(_ lhs: [UInt8], _ rhs: [UInt8]) -> Int {
+        guard lhs.count == rhs.count, !lhs.isEmpty else {
+            return Int.max
+        }
+
+        let totalDifference = zip(lhs, rhs).reduce(0) { partial, pair in
+            partial + abs(Int(pair.0) - Int(pair.1))
+        }
+        return totalDifference / lhs.count
+    }
+
+    private func luminance(red: UInt8, green: UInt8, blue: UInt8) -> Int {
+        (299 * Int(red) + 587 * Int(green) + 114 * Int(blue)) / 1000
     }
 
     private func preferredFilename(for url: URL, mimeType: String, fallback: String) -> String {
@@ -1421,10 +1553,11 @@ public actor PortfolioScraperService {
     private func sourceDirectory(
         for pageURL: URL?,
         in mediaDirectory: URL,
-        organizeImagesBySourcePage: Bool
+        organizeImagesBySourcePage: Bool,
+        mediaKind: MediaKind
     ) -> URL {
         guard organizeImagesBySourcePage else {
-            return mediaDirectory
+            return mediaDirectory.appendingPathComponent(mediaKind.folderName, isDirectory: true)
         }
 
         var directory = mediaDirectory
@@ -1490,6 +1623,21 @@ public actor PortfolioScraperService {
         let effectiveBase = cleanedBase.isEmpty ? fallbackBase : cleanedBase
         let truncatedBase = truncatedBaseName(effectiveBase, extensionLength: cleanedExtension.count, suffixLength: 0)
         return cleanedExtension.isEmpty ? truncatedBase : "\(truncatedBase).\(cleanedExtension)"
+    }
+
+    private func filenameByAppendingDoneMarker(
+        to preferredName: String,
+        checkForDuplicates: Bool,
+        duplicateOutcome: String
+    ) -> String {
+        let fileURL = URL(fileURLWithPath: preferredName)
+        let ext = fileURL.pathExtension
+        let baseName = fileURL.deletingPathExtension().lastPathComponent
+        let marker = checkForDuplicates ? "DONE-CHECKON-\(duplicateOutcome)" : "DONE-CHECKOFF-\(duplicateOutcome)"
+        if ext.isEmpty {
+            return "\(baseName) \(marker)"
+        }
+        return "\(baseName) \(marker).\(ext)"
     }
 
     private func sanitizeBaseName(_ value: String) -> String {
