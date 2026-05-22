@@ -14,7 +14,7 @@ struct QueuedJob: Identifiable, Equatable {
 
 @MainActor
 final class AppViewModel: ObservableObject {
-    let maxImageOptions = [50, 200, 400]
+    let maxImageOptions = [100, 200, 400, 600, 800]
     private let cliCommandName = "folioscraper"
     private let bundledCLIName = "folioscraper-cli"
     private let cliInstallPath = "/usr/local/bin/folioscraper"
@@ -22,13 +22,28 @@ final class AppViewModel: ObservableObject {
     private let failedPromptBundlePathKey = "failedCLIInstallPromptBundlePath"
     private let queuedJobURLsKey = "queuedJobURLs"
     private let currentJobURLKey = "currentJobURL"
+    private let selectedMaxImagesKey = "selectedMaxImages"
+    private let saveDetailsKey = "saveDetails"
+    private let downloadSmallImagesKey = "downloadSmallImages"
+    private let checkForDuplicatesKey = "checkForDuplicates"
+    private let organiseImagesBySourcePageKey = "organiseImagesBySourcePage"
 
     @Published var inputURL = ""
-    @Published var selectedMaxImages = 200
-    @Published var saveDetails = true
-    @Published var downloadSmallImages = false
-    @Published var checkForDuplicates = true
-    @Published var organizeImagesBySourcePage = true
+    @Published var selectedMaxImages = 200 {
+        didSet { persistOptionState() }
+    }
+    @Published var saveDetails = true {
+        didSet { persistOptionState() }
+    }
+    @Published var downloadSmallImages = false {
+        didSet { persistOptionState() }
+    }
+    @Published var checkForDuplicates = true {
+        didSet { persistOptionState() }
+    }
+    @Published var organizeImagesBySourcePage = true {
+        didSet { persistOptionState() }
+    }
     @Published private(set) var queuedJobs: [QueuedJob] = [] {
         didSet {
             guard !isRestoringQueueState else { return }
@@ -54,9 +69,11 @@ final class AppViewModel: ObservableObject {
     private var attemptedCLISetup = false
     private var scrapeTask: Task<Void, Never>?
     private var stopRequested = false
+    private var isRestoringOptionState = false
     private var isRestoringQueueState = false
 
     init() {
+        restoreOptionState()
         restoreQueueState()
     }
 
@@ -254,6 +271,47 @@ final class AppViewModel: ObservableObject {
         defaults.set(currentJob?.url.absoluteString, forKey: currentJobURLKey)
     }
 
+    private func persistOptionState() {
+        guard !isRestoringOptionState else { return }
+
+        let defaults = UserDefaults.standard
+        defaults.set(selectedMaxImages, forKey: selectedMaxImagesKey)
+        defaults.set(saveDetails, forKey: saveDetailsKey)
+        defaults.set(downloadSmallImages, forKey: downloadSmallImagesKey)
+        defaults.set(checkForDuplicates, forKey: checkForDuplicatesKey)
+        defaults.set(organizeImagesBySourcePage, forKey: organiseImagesBySourcePageKey)
+    }
+
+    private func restoreOptionState() {
+        let defaults = UserDefaults.standard
+
+        isRestoringOptionState = true
+        defer {
+            isRestoringOptionState = false
+            persistOptionState()
+        }
+
+        if defaults.object(forKey: selectedMaxImagesKey) != nil {
+            let persistedMaxImages = defaults.integer(forKey: selectedMaxImagesKey)
+            if maxImageOptions.contains(persistedMaxImages) {
+                selectedMaxImages = persistedMaxImages
+            }
+        }
+
+        if let value = defaults.persistedBool(forKey: saveDetailsKey) {
+            saveDetails = value
+        }
+        if let value = defaults.persistedBool(forKey: downloadSmallImagesKey) {
+            downloadSmallImages = value
+        }
+        if let value = defaults.persistedBool(forKey: checkForDuplicatesKey) {
+            checkForDuplicates = value
+        }
+        if let value = defaults.persistedBool(forKey: organiseImagesBySourcePageKey) {
+            organizeImagesBySourcePage = value
+        }
+    }
+
     private func restoreQueueState() {
         let defaults = UserDefaults.standard
         let persistedQueueURLs = defaults.stringArray(forKey: queuedJobURLsKey) ?? []
@@ -413,5 +471,12 @@ final class AppViewModel: ObservableObject {
         alert.informativeText = message
         alert.alertStyle = .warning
         alert.runModal()
+    }
+}
+
+private extension UserDefaults {
+    func persistedBool(forKey key: String) -> Bool? {
+        guard object(forKey: key) != nil else { return nil }
+        return bool(forKey: key)
     }
 }

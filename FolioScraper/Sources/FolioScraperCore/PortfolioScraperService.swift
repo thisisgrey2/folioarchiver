@@ -376,6 +376,7 @@ public actor PortfolioScraperService {
             baseURL: baseURL,
             into: &found
         )
+        insertCargoMediaCandidates(from: html, into: &found)
         insertSanityImageCandidates(from: html, into: &found)
 
         return found
@@ -567,9 +568,23 @@ public actor PortfolioScraperService {
             return []
         }
 
-        let rawPaths = Set(
+        var rawPaths = Set(
             regexMatches(
                 pattern: #""project_url"\s*:\s*"([^"]+)""#,
+                in: html,
+                options: [.caseInsensitive, .dotMatchesLineSeparators]
+            )
+        )
+        rawPaths.formUnion(
+            regexMatches(
+                pattern: #""purl"\s*:\s*"([^"]+)""#,
+                in: html,
+                options: [.caseInsensitive, .dotMatchesLineSeparators]
+            )
+        )
+        rawPaths.formUnion(
+            regexMatches(
+                pattern: #"<media-item\b[^>]*\bhref="([^"]+)""#,
                 in: html,
                 options: [.caseInsensitive, .dotMatchesLineSeparators]
             )
@@ -582,6 +597,88 @@ public actor PortfolioScraperService {
             }
             return crawlableInternalURL(from: decodedPath, baseURL: baseURL, siteURL: baseURL)
         }
+    }
+
+    private func insertCargoMediaCandidates(from html: String, into found: inout Set<URL>) {
+        guard html.contains("media-item") || html.contains("\"version\":\"Cargo3\"") else {
+            return
+        }
+
+        guard let state = cargoPreloadedState(from: html) else {
+            return
+        }
+
+        for media in cargoMediaRecords(in: state) {
+            guard let url = cargoMediaURL(for: media) else {
+                continue
+            }
+            found.insert(url)
+        }
+    }
+
+    private func cargoPreloadedState(from html: String) -> Any? {
+        let marker = "window.__PRELOADED_STATE__="
+        guard let markerRange = html.range(of: marker) else {
+            return nil
+        }
+
+        let stateStart = markerRange.upperBound
+        guard let scriptEnd = html[stateStart...].range(of: "</script>")?.lowerBound else {
+            return nil
+        }
+
+        let json = String(html[stateStart..<scriptEnd])
+        guard let data = json.data(using: .utf8) else {
+            return nil
+        }
+
+        return try? JSONSerialization.jsonObject(with: data, options: [])
+    }
+
+    private func cargoMediaRecords(in object: Any) -> [[String: Any]] {
+        var records: [[String: Any]] = []
+
+        func walk(_ value: Any) {
+            if let dictionary = value as? [String: Any] {
+                if isCargoMediaRecord(dictionary) {
+                    records.append(dictionary)
+                }
+                for child in dictionary.values {
+                    walk(child)
+                }
+            } else if let array = value as? [Any] {
+                for child in array {
+                    walk(child)
+                }
+            }
+        }
+
+        walk(object)
+        return records
+    }
+
+    private func isCargoMediaRecord(_ dictionary: [String: Any]) -> Bool {
+        guard dictionary["hash"] as? String != nil,
+              dictionary["name"] as? String != nil,
+              let fileType = (dictionary["file_type"] as? String)?.lowercased() else {
+            return false
+        }
+
+        return imageExtensions.contains(fileType) || videoExtensions.contains(fileType)
+    }
+
+    private func cargoMediaURL(for media: [String: Any]) -> URL? {
+        guard let hash = media["hash"] as? String,
+              let name = media["name"] as? String,
+              !hash.isEmpty,
+              !name.isEmpty else {
+            return nil
+        }
+
+        let encodedName = name.addingPercentEncoding(
+            withAllowedCharacters: CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))
+        ) ?? name
+        return URL(string: "https://freight.cargo.site/t/original/i/\(hash)/\(encodedName)")
     }
 
     private func normalize(candidate rawValue: String, baseURL: URL) -> URL? {

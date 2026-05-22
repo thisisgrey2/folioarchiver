@@ -59,7 +59,7 @@ struct ContentView: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 14))
 
-                Button("Add To Queue") {
+                Button("Add to queue") {
                     viewModel.enqueueCurrentInput()
                 }
                 .buttonStyle(.borderedProminent)
@@ -107,7 +107,7 @@ struct ContentView: View {
                 .toggleStyle(.checkbox)
                 .padding(.top, 10)
 
-            Toggle("Organize images by source page", isOn: $viewModel.organizeImagesBySourcePage)
+            Toggle("Organise images by source page", isOn: $viewModel.organizeImagesBySourcePage)
                 .font(.system(size: 13))
                 .toggleStyle(.checkbox)
                 .padding(.top, 10)
