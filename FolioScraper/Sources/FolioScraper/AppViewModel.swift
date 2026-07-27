@@ -12,9 +12,55 @@ struct QueuedJob: Identifiable, Equatable {
     }
 }
 
+/// Resolves the first result and cancels the losing work without waiting for it to cooperate.
+private final class TimeoutRace<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var tasks: [Task<Void, Never>] = []
+
+    func setContinuation(_ continuation: CheckedContinuation<Value, Error>) {
+        lock.lock()
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func setTasks(_ tasks: [Task<Void, Never>]) {
+        lock.lock()
+        let alreadyResolved = continuation == nil
+        if !alreadyResolved {
+            self.tasks = tasks
+        }
+        lock.unlock()
+
+        if alreadyResolved {
+            tasks.forEach { $0.cancel() }
+        }
+    }
+
+    func resolve(_ result: Result<Value, Error>) {
+        lock.lock()
+        let continuation = continuation
+        let tasks = tasks
+        self.continuation = nil
+        self.tasks = []
+        lock.unlock()
+
+        tasks.forEach { $0.cancel() }
+        continuation?.resume(with: result)
+    }
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
-    let maxImageOptions = [100, 200, 400, 600, 800]
+    private struct ScrapeTimeoutError: LocalizedError {
+        let seconds: Int
+
+        var errorDescription: String? {
+            "Site scrape timed out after \(seconds / 60) minutes"
+        }
+    }
+
+    let maxImageOptions = [200, 400, 800, 1_500]
     private let cliCommandName = "folioscraper"
     private let bundledCLIName = "folioscraper-cli"
     private let cliInstallPath = "/usr/local/bin/folioscraper"
@@ -25,8 +71,11 @@ final class AppViewModel: ObservableObject {
     private let selectedMaxImagesKey = "selectedMaxImages"
     private let saveDetailsKey = "saveDetails"
     private let downloadSmallImagesKey = "downloadSmallImages"
-    private let checkForDuplicatesKey = "checkForDuplicates"
+    private let downloadVideosKey = "downloadVideos"
     private let organiseImagesBySourcePageKey = "organiseImagesBySourcePage"
+    private let interruptedRetryCountsKey = "interruptedJobRetryCounts"
+    private let maxRecoveredAutoRetries = 1
+    private let siteTimeout: Duration = .seconds(1800)
 
     @Published var inputURL = ""
     @Published var selectedMaxImages = 200 {
@@ -38,7 +87,7 @@ final class AppViewModel: ObservableObject {
     @Published var downloadSmallImages = false {
         didSet { persistOptionState() }
     }
-    @Published var checkForDuplicates = true {
+    @Published var downloadVideos = true {
         didSet { persistOptionState() }
     }
     @Published var organizeImagesBySourcePage = true {
@@ -71,6 +120,7 @@ final class AppViewModel: ObservableObject {
     private var stopRequested = false
     private var isRestoringOptionState = false
     private var isRestoringQueueState = false
+    private var shouldAutoStartRestoredQueue = true
 
     init() {
         restoreOptionState()
@@ -118,6 +168,7 @@ final class AppViewModel: ObservableObject {
             return
         }
 
+        clearInterruptedRetryCount(for: normalizedURL)
         queuedJobs.append(QueuedJob(url: normalizedURL))
         appendLog("Queued \(normalizedURL.absoluteString)")
         startNextJobIfNeeded()
@@ -146,17 +197,19 @@ final class AppViewModel: ObservableObject {
             guard let self else { return }
 
             do {
-                let result = try await self.scraper.scrape(
-                    startURL: nextJob.url,
-                    maxImages: self.selectedMaxImages,
-                    outputRoot: nil,
-                    saveDetails: self.saveDetails,
-                    downloadSmallImages: self.downloadSmallImages,
-                    checkForDuplicates: self.checkForDuplicates,
-                    organizeImagesBySourcePage: self.organizeImagesBySourcePage
-                ) { line in
-                    await MainActor.run {
-                        self.appendLog(line)
+                let result = try await self.runScrapeWithTimeout(for: nextJob) {
+                    try await self.scraper.scrape(
+                        startURL: nextJob.url,
+                        maxImages: self.selectedMaxImages,
+                        outputRoot: nil,
+                        saveDetails: self.saveDetails,
+                        downloadSmallImages: self.downloadSmallImages,
+                        downloadVideos: self.downloadVideos,
+                        organizeImagesBySourcePage: self.organizeImagesBySourcePage
+                    ) { line in
+                        await MainActor.run {
+                            self.appendLog(line)
+                        }
                     }
                 }
 
@@ -179,6 +232,7 @@ final class AppViewModel: ObservableObject {
         scrapeTask = nil
         stopRequested = false
         isRunning = false
+        clearInterruptedRetryCount(for: currentJob?.url)
         currentJob = nil
         statusText = "Finished \(result.studio)"
         statusColor = .green
@@ -202,6 +256,7 @@ final class AppViewModel: ObservableObject {
         scrapeTask = nil
         stopRequested = false
         isRunning = false
+        clearInterruptedRetryCount(for: job.url)
         currentJob = nil
         statusText = "Error"
         statusColor = .red
@@ -231,6 +286,7 @@ final class AppViewModel: ObservableObject {
     private func finishStopped(for job: QueuedJob) {
         scrapeTask = nil
         isRunning = false
+        clearInterruptedRetryCount(for: job.url)
         currentJob = nil
         statusText = "Stopped"
         statusColor = .orange
@@ -245,7 +301,11 @@ final class AppViewModel: ObservableObject {
     }
 
     func removeQueuedJob(id: UUID) {
+        let removedURLs = queuedJobs.filter { $0.id == id }.map(\.url)
         queuedJobs.removeAll { $0.id == id }
+        for url in removedURLs {
+            clearInterruptedRetryCount(for: url)
+        }
     }
 
     func moveQueuedJob(id: UUID, before targetID: UUID) {
@@ -278,7 +338,7 @@ final class AppViewModel: ObservableObject {
         defaults.set(selectedMaxImages, forKey: selectedMaxImagesKey)
         defaults.set(saveDetails, forKey: saveDetailsKey)
         defaults.set(downloadSmallImages, forKey: downloadSmallImagesKey)
-        defaults.set(checkForDuplicates, forKey: checkForDuplicatesKey)
+        defaults.set(downloadVideos, forKey: downloadVideosKey)
         defaults.set(organizeImagesBySourcePage, forKey: organiseImagesBySourcePageKey)
     }
 
@@ -304,8 +364,8 @@ final class AppViewModel: ObservableObject {
         if let value = defaults.persistedBool(forKey: downloadSmallImagesKey) {
             downloadSmallImages = value
         }
-        if let value = defaults.persistedBool(forKey: checkForDuplicatesKey) {
-            checkForDuplicates = value
+        if let value = defaults.persistedBool(forKey: downloadVideosKey) {
+            downloadVideos = value
         }
         if let value = defaults.persistedBool(forKey: organiseImagesBySourcePageKey) {
             organizeImagesBySourcePage = value
@@ -316,14 +376,24 @@ final class AppViewModel: ObservableObject {
         let defaults = UserDefaults.standard
         let persistedQueueURLs = defaults.stringArray(forKey: queuedJobURLsKey) ?? []
         let persistedCurrentURL = defaults.string(forKey: currentJobURLKey)
+        let retryCounts = interruptedRetryCounts()
 
         var restoredJobs: [QueuedJob] = []
         var seenURLs = Set<String>()
+        var deferredInterruptedJob: QueuedJob?
+        shouldAutoStartRestoredQueue = true
 
         if let persistedCurrentURL,
            let url = normalizedURL(from: persistedCurrentURL) {
-            restoredJobs.append(QueuedJob(url: url))
             seenURLs.insert(url.absoluteString)
+            let retryCount = retryCounts[url.absoluteString] ?? 0
+            if retryCount < maxRecoveredAutoRetries {
+                restoredJobs.append(QueuedJob(url: url))
+                setInterruptedRetryCount(retryCount + 1, for: url)
+            } else {
+                deferredInterruptedJob = QueuedJob(url: url)
+                shouldAutoStartRestoredQueue = false
+            }
         }
 
         for persistedURL in persistedQueueURLs {
@@ -333,7 +403,7 @@ final class AppViewModel: ObservableObject {
             }
         }
 
-        guard !restoredJobs.isEmpty else { return }
+        guard !restoredJobs.isEmpty || deferredInterruptedJob != nil else { return }
 
         isRestoringQueueState = true
         queuedJobs = restoredJobs
@@ -347,7 +417,73 @@ final class AppViewModel: ObservableObject {
             appendLog("Restored \(restoredJobs.count) queued site(s) from the previous session.")
         }
 
-        startNextJobIfNeeded()
+        if let deferredInterruptedJob {
+            queuedJobs.append(deferredInterruptedJob)
+            appendLog("Recovered \(deferredInterruptedJob.displayText), but it was interrupted multiple times. Retry it manually after the rest of the queue.")
+        }
+
+        if shouldAutoStartRestoredQueue {
+            startNextJobIfNeeded()
+        } else if !restoredJobs.isEmpty {
+            appendLog("Automatic restart was skipped to avoid repeating the same stuck site immediately.")
+            startNextJobIfNeeded()
+        } else if !queuedJobs.isEmpty {
+            appendLog("Automatic restart was skipped to avoid repeating the same stuck site immediately.")
+        }
+    }
+
+    private func interruptedRetryCounts() -> [String: Int] {
+        UserDefaults.standard.dictionary(forKey: interruptedRetryCountsKey) as? [String: Int] ?? [:]
+    }
+
+    private func setInterruptedRetryCount(_ count: Int, for url: URL) {
+        var counts = interruptedRetryCounts()
+        counts[url.absoluteString] = count
+        UserDefaults.standard.set(counts, forKey: interruptedRetryCountsKey)
+    }
+
+    private func clearInterruptedRetryCount(for url: URL?) {
+        guard let url else { return }
+        var counts = interruptedRetryCounts()
+        counts.removeValue(forKey: url.absoluteString)
+        UserDefaults.standard.set(counts, forKey: interruptedRetryCountsKey)
+    }
+
+    private func runScrapeWithTimeout<T: Sendable>(
+        for job: QueuedJob,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let timeoutSeconds = Int(siteTimeout.components.seconds)
+        let timeout = siteTimeout
+        let race = TimeoutRace<T>()
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                race.setContinuation(continuation)
+
+                let scrapeTask = Task {
+                    do {
+                        race.resolve(.success(try await operation()))
+                    } catch {
+                        race.resolve(.failure(error))
+                    }
+                }
+                let timeoutTask = Task {
+                    do {
+                        try await Task.sleep(for: timeout)
+                        race.resolve(.failure(ScrapeTimeoutError(seconds: timeoutSeconds)))
+                    } catch is CancellationError {
+                        // The scrape completed or the user stopped it before the timeout.
+                    } catch {
+                        race.resolve(.failure(error))
+                    }
+                }
+
+                race.setTasks([scrapeTask, timeoutTask])
+            }
+        } onCancel: {
+            race.resolve(.failure(CancellationError()))
+        }
     }
 
     private func installCLIWrapperIfNeeded() {

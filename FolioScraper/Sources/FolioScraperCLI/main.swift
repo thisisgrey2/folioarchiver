@@ -74,12 +74,11 @@ struct FolioScraperCLI {
     }
 }
 
-let cliCompletion = DispatchSemaphore(value: 0)
 Task {
     await FolioScraperCLI.run()
-    cliCompletion.signal()
+    exit(0)
 }
-cliCompletion.wait()
+RunLoop.main.run()
 
 private struct CLICommand {
     enum Mode {
@@ -98,7 +97,7 @@ private struct CLICommand {
       folioscraper batch <file> [--max-images <count>] [--output <folder>] [--save-details]
 
     Batch files should contain one URL per line.
-    --max-images must be between 1 and 1000.
+    --max-images must be between 1 and 10000.
     --save-details writes a details.md file with the studio name and URL.
     """
 
@@ -108,7 +107,7 @@ private struct CLICommand {
         }
 
         let command = arguments[1]
-        var maxImages = 200
+        var maxImages = 1_000
         var outputRoot: URL?
         var saveDetails = false
         var positionals: [String] = []
@@ -121,7 +120,7 @@ private struct CLICommand {
                 index += 1
                 guard index < arguments.count,
                       let value = Int(arguments[index]),
-                      (1...1000).contains(value) else {
+                      (1...10_000).contains(value) else {
                     throw CLIError.invalidOption("--max-images")
                 }
                 maxImages = value

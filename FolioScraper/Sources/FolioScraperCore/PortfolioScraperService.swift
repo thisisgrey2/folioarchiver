@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -18,6 +19,7 @@ public struct ScrapeResult: Sendable {
 private enum PortfolioScraperError: LocalizedError {
     case httpStatus(code: Int, url: URL?)
     case emptyAsset(url: URL?)
+    case timedOut(step: String, seconds: Int)
 
     var errorDescription: String? {
         switch self {
@@ -31,6 +33,8 @@ private enum PortfolioScraperError: LocalizedError {
                 return "Empty asset payload for \(url.absoluteString)"
             }
             return "Empty asset payload"
+        case .timedOut(let step, let seconds):
+            return "\(step) timed out after \(seconds) seconds"
         }
     }
 }
@@ -43,6 +47,17 @@ private struct AssetCandidate {
 private struct AssetResponse {
     let data: Data
     let mimeType: String?
+}
+
+private struct CargoProject {
+    let url: URL?
+    let thumbnailURL: URL?
+}
+
+private struct CargoCatalog {
+    let projects: [CargoProject]
+    let collectionCount: Int
+    let failedCollections: Int
 }
 
 private struct ImageFingerprint {
@@ -61,6 +76,7 @@ private struct ImageFingerprint {
 
 private struct SavedImageRecord {
     var fileURL: URL
+    var contentHash: String
     var fingerprint: ImageFingerprint
 }
 
@@ -69,7 +85,15 @@ private struct DownloadedImagePayload {
     let preferredName: String
     let width: Int
     let height: Int
+    let contentHash: String
     let fingerprint: ImageFingerprint?
+    let destinationDirectory: URL
+}
+
+private struct DownloadedVideoPayload {
+    let data: Data
+    let preferredName: String
+    let contentHash: String
     let destinationDirectory: URL
 }
 
@@ -88,11 +112,15 @@ private enum MediaKind {
 }
 
 public actor PortfolioScraperService {
-    private let browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    private let browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
     private let maxVideoBytes = 50 * 1024 * 1024
-    private let maxCrawlPages = 100
+    private let maxCrawlPages = 500
+    private let maxCargoCollections = 100
     private let minPixelSize = 900
     private let maxFilenameLength = 120
+    private let curlTimeout: Duration = .seconds(180)
+    private let maximumTransientAttempts = 2
+    private let transientRetryDelay: Duration = .seconds(2)
     private let imageExtensions = Set(["jpg", "jpeg", "png", "webp", "gif", "avif"])
     private let videoExtensions = Set(["mp4", "mov", "webm", "m4v", "ogv"])
     private let stripQueryPrefixes = [
@@ -133,7 +161,7 @@ public actor PortfolioScraperService {
         outputRoot: URL?,
         saveDetails: Bool,
         downloadSmallImages: Bool = false,
-        checkForDuplicates: Bool = true,
+        downloadVideos: Bool = true,
         organizeImagesBySourcePage: Bool = true,
         progress: @escaping @Sendable (String) async -> Void
     ) async throws -> ScrapeResult {
@@ -152,12 +180,98 @@ public actor PortfolioScraperService {
         var crawled = Set<URL>()
         var toCrawl = [normalizedStartURL]
         var allCandidates: [URL: URL] = [:]
+        var crawledStylesheets = Set<URL>()
         var isCargo = false
+        var cargoCatalogWasRead = false
+        var cargoProjectPagesWereQueued = false
+        var usedPageData = false
 
         while let url = toCrawl.first, crawled.count < maxCrawlPages {
             try Task.checkCancellation()
             toCrawl.removeFirst()
             guard crawled.insert(url).inserted else { continue }
+            var rawPageWasFetched = false
+
+            // Start with page data, then use the browser only when the page suggests
+            // lazy or script-driven media that source parsing cannot reliably expose.
+            if let (html, finalURL) = try? await fetchString(from: url) {
+                rawPageWasFetched = true
+                let isCargoPage = html.contains("\"version\":\"Cargo3\"") || html.contains("freight.cargo.site") || html.contains("cargo.site")
+                var rawCandidates = extractCandidates(from: html, baseURL: finalURL)
+                rawCandidates.formUnion(
+                    await stylesheetCandidates(
+                        from: html,
+                        baseURL: finalURL,
+                        crawledStylesheets: &crawledStylesheets
+                    )
+                )
+                mergeCandidates(
+                    rawCandidates,
+                    sourcePage: finalURL,
+                    into: &allCandidates
+                )
+
+                // Follow the site's own project links, but avoid speculative URL probes
+                // when the page already provides a working media list.
+                let internalLinks = extractInternalLinks(from: html, baseURL: finalURL)
+                enqueueDiscoveredLinks(internalLinks, crawled: crawled, pending: &toCrawl)
+
+                if isCargoPage {
+                    if url == normalizedStartURL {
+                        isCargo = true
+                        await progress("Cargo detected. Reading public project catalogue.")
+
+                        if !cargoCatalogWasRead {
+                            cargoCatalogWasRead = true
+                            let catalog = await cargoCatalog(from: html, baseURL: finalURL)
+                            let projectURLs = catalog.projects.compactMap(\.url)
+                            let thumbnailURLs = Set(catalog.projects.compactMap(\.thumbnailURL))
+
+                            mergeCandidates(
+                                thumbnailURLs,
+                                sourcePage: finalURL,
+                                into: &allCandidates
+                            )
+                            enqueueDiscoveredLinks(projectURLs, crawled: crawled, pending: &toCrawl)
+
+                            if !projectURLs.isEmpty {
+                                cargoProjectPagesWereQueued = true
+                                let failureSuffix = catalog.failedCollections == 0
+                                    ? ""
+                                    : " (\(catalog.failedCollections) collection(s) unavailable)"
+                                await progress(
+                                    "Cargo catalogue found \(projectURLs.count) public project page(s) across \(catalog.collectionCount) collection(s)\(failureSuffix)."
+                                )
+                            } else {
+                                let staticProjectLinks = extractCargoProjectLinks(from: html, baseURL: finalURL)
+                                enqueueDiscoveredLinks(staticProjectLinks, crawled: crawled, pending: &toCrawl)
+                                cargoProjectPagesWereQueued = !staticProjectLinks.isEmpty
+                                await progress("Cargo catalogue exposed no project pages. Using page-data fallback.")
+                            }
+                        }
+                    }
+
+                    // Cargo project pages expose their own media in page data. Avoid the
+                    // browser unless both its catalogue and raw page data were unavailable.
+                    if url != normalizedStartURL || cargoProjectPagesWereQueued {
+                        continue
+                    }
+                }
+
+                if url == normalizedStartURL {
+                    let slugLinks = await extractSlugLinks(from: html, baseURL: finalURL)
+                    enqueueDiscoveredLinks(slugLinks, crawled: crawled, pending: &toCrawl)
+                }
+
+                if !rawCandidates.isEmpty {
+                    usedPageData = true
+                    if !needsRenderedDiscovery(for: html, rawCandidateCount: rawCandidates.count) {
+                        await progress("Found media in page data. Browser rendering is not needed.")
+                        continue
+                    }
+                    await progress("Found page media. Checking dynamic content as well.")
+                }
+            }
 
             await progress("Rendering \(url.absoluteString)")
 
@@ -180,66 +294,85 @@ public actor PortfolioScraperService {
                     into: &allCandidates
                 )
 
-                let htmlLinks = extractInternalLinks(from: snapshot.html, baseURL: normalizedStartURL)
-                let domLinks = normalizedInternalLinks(from: snapshot.internalLinkCandidates, siteURL: normalizedStartURL)
+                let htmlLinks = extractInternalLinks(from: snapshot.html, baseURL: snapshot.finalURL)
+                let domLinks = normalizedInternalLinks(from: snapshot.internalLinkCandidates, siteURL: snapshot.finalURL)
                 enqueueDiscoveredLinks(Array(Set(htmlLinks + domLinks)), crawled: crawled, pending: &toCrawl)
 
                 if url == normalizedStartURL {
-                    let slugLinks = await extractSlugLinks(from: snapshot.html, baseURL: normalizedStartURL)
+                    let slugLinks = await extractSlugLinks(from: snapshot.html, baseURL: snapshot.finalURL)
                     enqueueDiscoveredLinks(slugLinks, crawled: crawled, pending: &toCrawl)
                 }
 
-                do {
+                if !rawPageWasFetched {
+                    do {
                     let (html, finalURL) = try await fetchString(from: url)
-                    mergeCandidates(
-                        extractCandidates(from: html, baseURL: finalURL),
-                        sourcePage: finalURL,
-                        into: &allCandidates
-                    )
+                        var candidates = extractCandidates(from: html, baseURL: finalURL)
+                        candidates.formUnion(
+                            await stylesheetCandidates(
+                                from: html,
+                                baseURL: finalURL,
+                                crawledStylesheets: &crawledStylesheets
+                            )
+                        )
+                        mergeCandidates(candidates, sourcePage: finalURL, into: &allCandidates)
 
-                    let internalLinks = extractInternalLinks(from: html, baseURL: normalizedStartURL)
-                    enqueueDiscoveredLinks(internalLinks, crawled: crawled, pending: &toCrawl)
+                        let internalLinks = extractInternalLinks(from: html, baseURL: finalURL)
+                        enqueueDiscoveredLinks(internalLinks, crawled: crawled, pending: &toCrawl)
 
-                    if url == normalizedStartURL {
-                        let slugLinks = await extractSlugLinks(from: html, baseURL: normalizedStartURL)
-                        enqueueDiscoveredLinks(slugLinks, crawled: crawled, pending: &toCrawl)
+                        if url == normalizedStartURL {
+                            let slugLinks = await extractSlugLinks(from: html, baseURL: finalURL)
+                            enqueueDiscoveredLinks(slugLinks, crawled: crawled, pending: &toCrawl)
+                        }
+                    } catch {
+                        // Keep the rendered crawl results even if the raw HTML fetch is blocked.
                     }
-                } catch {
-                    // Keep the rendered crawl results even if the raw HTML fetch is blocked.
                 }
             } catch {
                 await progress("Rendered crawl failed for \(url.absoluteString): \(error.localizedDescription)")
 
-                do {
+                if !rawPageWasFetched {
+                    do {
                     let (html, finalURL) = try await fetchString(from: url)
-                    mergeCandidates(
-                        extractCandidates(from: html, baseURL: finalURL),
-                        sourcePage: finalURL,
-                        into: &allCandidates
-                    )
+                        var candidates = extractCandidates(from: html, baseURL: finalURL)
+                        candidates.formUnion(
+                            await stylesheetCandidates(
+                                from: html,
+                                baseURL: finalURL,
+                                crawledStylesheets: &crawledStylesheets
+                            )
+                        )
+                        mergeCandidates(candidates, sourcePage: finalURL, into: &allCandidates)
 
-                    let internalLinks = extractInternalLinks(from: html, baseURL: normalizedStartURL)
-                    enqueueDiscoveredLinks(internalLinks, crawled: crawled, pending: &toCrawl)
+                        let internalLinks = extractInternalLinks(from: html, baseURL: finalURL)
+                        enqueueDiscoveredLinks(internalLinks, crawled: crawled, pending: &toCrawl)
 
-                    if url == normalizedStartURL {
-                        let slugLinks = await extractSlugLinks(from: html, baseURL: normalizedStartURL)
-                        enqueueDiscoveredLinks(slugLinks, crawled: crawled, pending: &toCrawl)
+                        if url == normalizedStartURL {
+                            let slugLinks = await extractSlugLinks(from: html, baseURL: finalURL)
+                            enqueueDiscoveredLinks(slugLinks, crawled: crawled, pending: &toCrawl)
+                        }
+                    } catch {
+                        await progress("Failed to crawl \(url.absoluteString): \(error.localizedDescription)")
                     }
-                } catch {
-                    await progress("Failed to crawl \(url.absoluteString): \(error.localizedDescription)")
                 }
             }
         }
 
-        let upgradedCandidates = upgradeWordPressURLs(in: Set(allCandidates.keys))
-        var referersByURL: [URL: URL] = [:]
-        for url in upgradedCandidates {
-            if let referer = allCandidates[url] {
-                referersByURL[url] = referer
-            }
+        if !toCrawl.isEmpty {
+            await progress("Reached the \(maxCrawlPages)-page crawl limit with \(toCrawl.count) page(s) still queued.")
         }
-        let deduped = selectLargestAssetVariants(from: upgradedCandidates).map {
-            AssetCandidate(url: $0, referer: referersByURL[$0])
+
+        let upgradedCandidates = upgradeWordPressCandidates(in: allCandidates)
+        let deduped = selectLargestAssetVariants(from: Set(upgradedCandidates.keys))
+            .sorted { lhs, rhs in
+                let lhsIsImage = imageExtensions.contains(lhs.pathExtension.lowercased())
+                let rhsIsImage = imageExtensions.contains(rhs.pathExtension.lowercased())
+                if lhsIsImage != rhsIsImage {
+                    return lhsIsImage
+                }
+                return lhs.absoluteString < rhs.absoluteString
+            }
+            .map {
+            AssetCandidate(url: $0, referer: upgradedCandidates[$0])
         }
         await progress("Found \(deduped.count) candidate files")
 
@@ -248,7 +381,7 @@ public actor PortfolioScraperService {
             maxImages: maxImages,
             outputDirectory: mediaDirectory,
             downloadSmallImages: downloadSmallImages,
-            checkForDuplicates: checkForDuplicates,
+            downloadVideos: downloadVideos,
             organizeImagesBySourcePage: organizeImagesBySourcePage,
             progress: progress
         )
@@ -261,7 +394,7 @@ public actor PortfolioScraperService {
             skippedSmall: downloadResult.skippedSmall,
             skippedLarge: downloadResult.skippedLarge,
             errors: downloadResult.errors,
-            platform: isCargo ? "Cargo (Rendered web crawl)" : "Rendered web crawl"
+            platform: isCargo ? "Cargo (Public project catalogue)" : (usedPageData ? "Page data crawl" : "Rendered web crawl")
         )
     }
 
@@ -313,12 +446,19 @@ public actor PortfolioScraperService {
         return sanitized.isEmpty ? "Portfolio" : sanitized
     }
 
-    private func fetchString(from url: URL) async throws -> (String, URL) {
-        let request = makeRequest(url: url)
-        let (data, response) = try await session.data(for: request)
-        _ = try validateSuccessfulHTTP(response, fallbackURL: url)
+    private func fetchString(from url: URL, referer: URL? = nil) async throws -> (String, URL) {
+        let request = makeRequest(url: url, referer: referer)
+        let (data, response) = try await dataWithTransientRetry(for: request)
         guard let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
             throw URLError(.cannotDecodeContentData)
+        }
+
+        // Some portfolio hosts send a 5xx status for a complete page. Keep a substantial
+        // HTML document available to the media parser instead of discarding usable content.
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200..<400).contains(httpResponse.statusCode),
+           !(html.count >= 4_096 && html.range(of: "<html", options: .caseInsensitive) != nil) {
+            _ = try validateSuccessfulHTTP(response, fallbackURL: url)
         }
         return (html, response.url ?? url)
     }
@@ -326,6 +466,17 @@ public actor PortfolioScraperService {
     private func makeRequest(url: URL, method: String = "GET", referer: URL? = nil) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = method
+        if url.host?.lowercased() == "freight.cargo.site",
+           imageExtensions.contains(url.pathExtension.lowercased()) {
+            // Cargo's CDN rejects generic HTTP clients for image transforms. These match
+            // the headers sent by an ordinary browser image request.
+            request.setValue("image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+            request.setValue("en-GB,en-US;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
+            request.setValue("image", forHTTPHeaderField: "Sec-Fetch-Dest")
+            request.setValue("no-cors", forHTTPHeaderField: "Sec-Fetch-Mode")
+            request.setValue("cross-site", forHTTPHeaderField: "Sec-Fetch-Site")
+            request.setValue("i", forHTTPHeaderField: "Priority")
+        }
         if let referer {
             request.setValue(referer.absoluteString, forHTTPHeaderField: "Referer")
             if url.host == referer.host,
@@ -337,27 +488,66 @@ public actor PortfolioScraperService {
         return request
     }
 
+    private func dataWithTransientRetry(for request: URLRequest) async throws -> (Data, URLResponse) {
+        for attempt in 1...maximumTransientAttempts {
+            try Task.checkCancellation()
+
+            do {
+                let result = try await session.data(for: request)
+                if isTransientHTTPResponse(result.1), attempt < maximumTransientAttempts {
+                    try await Task.sleep(for: transientRetryDelay)
+                    continue
+                }
+                return result
+            } catch {
+                guard isTransientNetworkError(error), attempt < maximumTransientAttempts else {
+                    throw error
+                }
+                try await Task.sleep(for: transientRetryDelay)
+            }
+        }
+
+        throw URLError(.unknown)
+    }
+
+    private func isTransientHTTPResponse(_ response: URLResponse) -> Bool {
+        guard let httpResponse = response as? HTTPURLResponse else { return false }
+        let status = httpResponse.statusCode
+        return status == 408 || status == 425 || status == 429 || (500...599).contains(status)
+    }
+
+    private func isTransientNetworkError(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .timedOut, .cannotConnectToHost, .cannotFindHost, .networkConnectionLost,
+             .notConnectedToInternet, .dnsLookupFailed, .resourceUnavailable:
+            return true
+        default:
+            return false
+        }
+    }
+
     private func extractCandidates(from html: String, baseURL: URL) -> Set<URL> {
         var found = Set<URL>()
 
         insertAttributeCandidates(
-            named: ["src", "data-src", "data-lazy-src", "data-original", "poster"],
+            named: [
+                "src", "data-src", "data-lazy-src", "data-original",
+                "data-image", "data-image-src", "data-background", "data-background-image",
+                "data-bg", "data-video-src", "poster"
+            ],
             from: html,
             baseURL: baseURL,
             into: &found
         )
         insertSrcsetCandidates(
-            named: ["srcset", "data-srcset"],
+            named: ["srcset", "data-srcset", "imagesrcset", "data-imagesrcset"],
             from: html,
             baseURL: baseURL,
             into: &found
         )
-        insertRegexMatches(
-            pattern: #"url\(["']?(https://[^"')\s]+)["']?\)"#,
-            from: html,
-            baseURL: baseURL,
-            into: &found
-        )
+        insertCSSURLCandidates(from: html, baseURL: baseURL, into: &found)
+        insertJSONMediaCandidates(from: html, baseURL: baseURL, into: &found)
         insertRegexMatches(
             pattern: #"https://static\.wixstatic\.com/media/[^\s"'<>]+"#,
             from: html,
@@ -380,6 +570,52 @@ public actor PortfolioScraperService {
         insertSanityImageCandidates(from: html, into: &found)
 
         return found
+    }
+
+    private func needsRenderedDiscovery(for html: String, rawCandidateCount: Int) -> Bool {
+        if rawCandidateCount < 4 {
+            return true
+        }
+
+        let lowered = html.lowercased()
+        let dynamicMarkers = [
+            "intersectionobserver", "infinite-scroll", "data-infinite", "__next_data__",
+            "self.__next_f", "__nuxt__", "__remixcontext", "astro-island", "sveltekit"
+        ]
+        return dynamicMarkers.contains { lowered.contains($0) }
+    }
+
+    private func stylesheetCandidates(
+        from html: String,
+        baseURL: URL,
+        crawledStylesheets: inout Set<URL>
+    ) async -> Set<URL> {
+        var pending = stylesheetURLs(from: html, baseURL: baseURL)
+        var found = Set<URL>()
+
+        while let stylesheetURL = pending.popLast() {
+            guard crawledStylesheets.insert(stylesheetURL).inserted,
+                  let (stylesheet, finalURL) = try? await fetchString(from: stylesheetURL, referer: baseURL) else {
+                continue
+            }
+
+            insertCSSURLCandidates(from: stylesheet, baseURL: finalURL, into: &found)
+            pending.append(contentsOf: importedStylesheetURLs(from: stylesheet, baseURL: finalURL))
+        }
+
+        return found
+    }
+
+    private func stylesheetURLs(from html: String, baseURL: URL) -> [URL] {
+        let pattern = #"<link\b(?=[^>]*\brel\s*=\s*["'][^"']*\bstylesheet\b[^"']*["'])(?=[^>]*\bhref\s*=\s*["']([^"']+)["'])[^>]*>"#
+        return regexMatches(pattern: pattern, in: html, options: [.caseInsensitive, .dotMatchesLineSeparators])
+            .compactMap { normalize(candidate: $0, baseURL: baseURL) }
+    }
+
+    private func importedStylesheetURLs(from stylesheet: String, baseURL: URL) -> [URL] {
+        let pattern = #"@import\s+(?:url\(\s*)?["']?([^"'\s\)]+)"#
+        return regexMatches(pattern: pattern, in: stylesheet)
+            .compactMap { normalize(candidate: $0, baseURL: baseURL) }
     }
 
     private func extractInternalLinks(from html: String, baseURL: URL) -> [URL] {
@@ -449,6 +685,32 @@ public actor PortfolioScraperService {
         }
     }
 
+    private func insertCSSURLCandidates(from text: String, baseURL: URL, into found: inout Set<URL>) {
+        let fontExtensions = Set(["eot", "otf", "ttf", "woff", "woff2"])
+        for rawValue in regexMatches(pattern: #"url\(\s*["']?([^"'\)\s]+)"#, in: text) {
+            guard let url = normalize(candidate: rawValue, baseURL: baseURL),
+                  !fontExtensions.contains(url.pathExtension.lowercased()) else {
+                continue
+            }
+            found.insert(url)
+        }
+    }
+
+    private func insertJSONMediaCandidates(from html: String, baseURL: URL, into found: inout Set<URL>) {
+        insertRegexMatches(
+            pattern: #"["'](?:src|image|imageurl|image_url|mediaurl|media_url|video|videourl|video_url|poster)["']\s*:\s*["']([^"']+)["']"#,
+            from: html,
+            baseURL: baseURL,
+            into: &found
+        )
+        insertRegexMatches(
+            pattern: #"((?:https?:)?//[^\s"'<>\\]+\.(?:jpg|jpeg|png|webp|gif|avif|mp4|mov|webm|m4v|ogv)(?:\?[^\s"'<>\\]*)?)"#,
+            from: html,
+            baseURL: baseURL,
+            into: &found
+        )
+    }
+
     private func insertSanityImageCandidates(from html: String, into found: inout Set<URL>) {
         guard let sanityConfig = sanityProjectConfiguration(in: html) else { return }
 
@@ -500,21 +762,67 @@ public actor PortfolioScraperService {
     }
 
     private func crawlableInternalURL(from rawValue: String, baseURL: URL, siteURL: URL) -> URL? {
-        let origin = "\(siteURL.scheme ?? "https")://\(siteURL.host ?? "")"
         guard let normalized = normalize(candidate: rawValue, baseURL: baseURL) else { return nil }
-        guard normalized.absoluteString.hasPrefix(origin) else { return nil }
-        guard normalized.absoluteString != siteURL.absoluteString else { return nil }
+        guard isSameSite(normalized, as: siteURL) else { return nil }
         guard shouldCrawlPage(url: normalized) else { return nil }
-        return stripFragmentAndQuery(from: normalized)
+        let crawlURL = canonicalCrawlURL(from: normalized)
+        guard crawlURL != canonicalCrawlURL(from: siteURL) else { return nil }
+        return crawlURL
+    }
+
+    private func isSameSite(_ candidate: URL, as siteURL: URL) -> Bool {
+        guard let candidateHost = candidate.host?.lowercased(),
+              let siteHost = siteURL.host?.lowercased() else {
+            return false
+        }
+
+        return canonicalHost(candidateHost) == canonicalHost(siteHost)
+    }
+
+    private func canonicalHost(_ host: String) -> String {
+        host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+    }
+
+    private func canonicalCrawlURL(from url: URL) -> URL {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.fragment = nil
+        let filteredQueryItems = components?.queryItems?
+            .filter { !isTrackingQueryItem($0.name) }
+            .sorted { lhs, rhs in
+                if lhs.name == rhs.name {
+                    return (lhs.value ?? "") < (rhs.value ?? "")
+                }
+                return lhs.name < rhs.name
+            }
+        components?.queryItems = filteredQueryItems
+        return components?.url ?? url
+    }
+
+    private func isTrackingQueryItem(_ name: String) -> Bool {
+        let lowered = name.lowercased()
+        return lowered.hasPrefix("utm_") || ["fbclid", "gclid", "dclid", "mc_cid", "mc_eid"].contains(lowered)
     }
 
     private func enqueueDiscoveredLinks(_ links: [URL], crawled: Set<URL>, pending: inout [URL]) {
-        for link in links {
+        // Portfolio pages often list navigation links before the actual work. Put likely
+        // project URLs first so the crawl reaches their media before secondary pages.
+        for link in links.sorted(by: { crawlPriority(for: $0) > crawlPriority(for: $1) }) {
             if crawled.contains(link) || pending.contains(link) {
                 continue
             }
             pending.append(link)
         }
+    }
+
+    private func crawlPriority(for url: URL) -> Int {
+        let path = url.path.lowercased()
+        if ["project", "work", "case", "portfolio"].contains(where: path.contains) {
+            return 2
+        }
+        if ["about", "contact", "privacy", "legal", "terms"].contains(where: path.contains) {
+            return 0
+        }
+        return 1
     }
 
     private func extractSlugLinks(from html: String, baseURL: URL) async -> [URL] {
@@ -549,7 +857,7 @@ public actor PortfolioScraperService {
 
                 do {
                     let request = makeRequest(url: candidate, method: "HEAD")
-                    let (_, response) = try await session.data(for: request)
+                    let (_, response) = try await dataWithTransientRetry(for: request)
                     if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
                         confirmed.append(candidate)
                         break
@@ -597,6 +905,113 @@ public actor PortfolioScraperService {
             }
             return crawlableInternalURL(from: decodedPath, baseURL: baseURL, siteURL: baseURL)
         }
+    }
+
+    private func cargoCatalog(from html: String, baseURL: URL) async -> CargoCatalog {
+        guard let state = cargoPreloadedState(from: html),
+              let stateDictionary = state as? [String: Any],
+              let site = stateDictionary["site"] as? [String: Any],
+              let siteID = cargoSiteID(from: site) else {
+            return CargoCatalog(projects: [], collectionCount: 0, failedCollections: 0)
+        }
+
+        let collectionIDs = cargoCollectionIDs(from: stateDictionary)
+        guard !collectionIDs.isEmpty else {
+            return CargoCatalog(projects: [], collectionCount: 0, failedCollections: 0)
+        }
+
+        var projectsByURL: [URL: CargoProject] = [:]
+        var thumbnailOnlyProjects: [CargoProject] = []
+        var failedCollections = 0
+
+        for collectionID in collectionIDs.prefix(maxCargoCollections) {
+            try? Task.checkCancellation()
+
+            guard let endpoint = cargoThumbnailEndpoint(siteID: siteID, collectionID: collectionID) else {
+                failedCollections += 1
+                continue
+            }
+
+            do {
+                let request = makeRequest(url: endpoint, referer: baseURL)
+                let (data, response) = try await dataWithTransientRetry(for: request)
+                _ = try validateSuccessfulHTTP(response, fallbackURL: endpoint)
+                guard let records = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                    failedCollections += 1
+                    continue
+                }
+
+                for record in records where record["display"] as? Bool != false {
+                    let project = CargoProject(
+                        url: cargoProjectURL(from: record, baseURL: baseURL),
+                        thumbnailURL: cargoThumbnailURL(from: record)
+                    )
+
+                    if let url = project.url {
+                        projectsByURL[url] = project
+                    } else if project.thumbnailURL != nil {
+                        thumbnailOnlyProjects.append(project)
+                    }
+                }
+            } catch {
+                failedCollections += 1
+            }
+        }
+
+        return CargoCatalog(
+            projects: Array(projectsByURL.values) + thumbnailOnlyProjects,
+            collectionCount: collectionIDs.count,
+            failedCollections: failedCollections
+        )
+    }
+
+    private func cargoSiteID(from site: [String: Any]) -> String? {
+        if let id = site["id"] as? String, !id.isEmpty {
+            return id
+        }
+        if let id = site["id"] as? NSNumber {
+            return id.stringValue
+        }
+        return nil
+    }
+
+    private func cargoCollectionIDs(from state: [String: Any]) -> [String] {
+        guard let sets = (state["sets"] as? [String: Any])?["byId"] as? [String: Any] else {
+            return []
+        }
+
+        return sets.compactMap { id, value in
+            guard let set = value as? [String: Any],
+                  let pageCount = set["page_count"] as? NSNumber,
+                  pageCount.intValue > 0 else {
+                return nil
+            }
+            return id
+        }
+        .sorted()
+    }
+
+    private func cargoThumbnailEndpoint(siteID: String, collectionID: String) -> URL? {
+        var components = URLComponents(string: "https://api.cargo.site/v1/pages/\(siteID)/thumbs/set/\(collectionID)")
+        components?.queryItems = [URLQueryItem(name: "limit", value: "999")]
+        return components?.url
+    }
+
+    private func cargoProjectURL(from record: [String: Any], baseURL: URL) -> URL? {
+        let rawPath = (record["project_url"] as? String) ?? (record["purl"] as? String)
+        guard let rawPath,
+              !rawPath.isEmpty,
+              !rawPath.hasPrefix("#") else {
+            return nil
+        }
+        return crawlableInternalURL(from: rawPath, baseURL: baseURL, siteURL: baseURL)
+    }
+
+    private func cargoThumbnailURL(from record: [String: Any]) -> URL? {
+        guard let thumbnail = record["thumbnail"] as? [String: Any] else {
+            return nil
+        }
+        return cargoMediaURL(for: thumbnail)
     }
 
     private func insertCargoMediaCandidates(from html: String, into found: inout Set<URL>) {
@@ -678,7 +1093,7 @@ public actor PortfolioScraperService {
         let encodedName = name.addingPercentEncoding(
             withAllowedCharacters: CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))
         ) ?? name
-        return URL(string: "https://freight.cargo.site/t/original/i/\(hash)/\(encodedName)")
+        return URL(string: "https://freight.cargo.site/w/3000/q/90/i/\(hash)/\(encodedName)")
     }
 
     private func normalize(candidate rawValue: String, baseURL: URL) -> URL? {
@@ -686,7 +1101,12 @@ public actor PortfolioScraperService {
 
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let htmlDecoded = decodeHTMLEntities(in: trimmed)
-        let lowered = htmlDecoded.lowercased()
+        let jsonDecoded = htmlDecoded
+            .replacingOccurrences(of: "\\/", with: "/")
+            .replacingOccurrences(of: "\\u002F", with: "/")
+            .replacingOccurrences(of: "\\u002f", with: "/")
+            .replacingOccurrences(of: "\\u0026", with: "&")
+        let lowered = jsonDecoded.lowercased()
         guard !lowered.hasPrefix("data:"),
               !lowered.hasPrefix("blob:"),
               !lowered.hasPrefix("mailto:"),
@@ -695,7 +1115,7 @@ public actor PortfolioScraperService {
             return nil
         }
 
-        let extracted = extractNextImageURL(from: htmlDecoded)
+        let extracted = extractNextImageURL(from: jsonDecoded)
         let resolved = URL(string: extracted, relativeTo: baseURL)?.absoluteURL
         guard var finalURL = resolved else { return nil }
 
@@ -767,16 +1187,25 @@ public actor PortfolioScraperService {
         return components?.url ?? url
     }
 
-    private func upgradeWordPressURLs(in urls: Set<URL>) -> Set<URL> {
-        var upgraded = Set<URL>()
+    private func upgradeWordPressCandidates(in candidates: [URL: URL]) -> [URL: URL] {
+        var upgraded: [URL: URL] = [:]
         let pattern = #"^(https?://[^/]+/wp-content/uploads/\d{4}/\d{2}/)(.+?)(-\d+x\d+)(\.[a-z]+)$"#
 
-        for url in urls {
+        for (url, referer) in candidates {
+            let upgradedURL: URL
             if let match = firstCaptureGroups(pattern: pattern, in: url.absoluteString), match.count == 4,
-               let upgradedURL = URL(string: match[0] + match[1] + match[3]) {
-                upgraded.insert(upgradedURL)
+               let originalURL = URL(string: match[0] + match[1] + match[3]) {
+                upgradedURL = originalURL
             } else {
-                upgraded.insert(url)
+                upgradedURL = url
+            }
+
+            if let existingReferer = upgraded[upgradedURL] {
+                if shouldPreferReferer(referer, over: existingReferer) {
+                    upgraded[upgradedURL] = referer
+                }
+            } else {
+                upgraded[upgradedURL] = referer
             }
         }
 
@@ -1001,12 +1430,13 @@ public actor PortfolioScraperService {
         maxImages: Int,
         outputDirectory: URL,
         downloadSmallImages: Bool,
-        checkForDuplicates: Bool,
+        downloadVideos: Bool,
         organizeImagesBySourcePage: Bool,
         progress: @escaping @Sendable (String) async -> Void
     ) async throws -> (downloaded: [URL], skippedSmall: Int, skippedLarge: Int, errors: Int) {
         var downloaded: [URL] = []
         var savedImageRecords: [SavedImageRecord] = []
+        var savedVideoHashes = Set<String>()
         var skippedSmall = 0
         var skippedLarge = 0
         var errors = 0
@@ -1019,7 +1449,6 @@ public actor PortfolioScraperService {
             let preferredName = if image.fingerprint != nil {
                 filenameByAppendingDoneMarker(
                     to: image.preferredName,
-                    checkForDuplicates: checkForDuplicates,
                     duplicateOutcome: duplicateOutcome
                 )
             } else {
@@ -1037,13 +1466,25 @@ public actor PortfolioScraperService {
             do {
                 let ext = candidate.url.pathExtension.lowercased()
                 if videoExtensions.contains(ext) {
+                    guard downloadVideos else {
+                        await progress("Skipped video \(candidate.url.lastPathComponent) (Download videos is off)")
+                        continue
+                    }
                     let videoResult = try await downloadVideo(
                         from: candidate,
                         outputDirectory: outputDirectory,
                         organizeImagesBySourcePage: organizeImagesBySourcePage
                     )
                     switch videoResult {
-                    case .downloaded(let fileURL):
+                    case .downloaded(let video):
+                        guard savedVideoHashes.insert(video.contentHash).inserted else {
+                            await progress("Skipped exact duplicate video \(video.preferredName)")
+                            continue
+                        }
+                        try FileManager.default.createDirectory(at: video.destinationDirectory, withIntermediateDirectories: true)
+                        let fileURL = try uniqueOutputURL(in: video.destinationDirectory, preferredName: video.preferredName)
+                        try Task.checkCancellation()
+                        try video.data.write(to: fileURL)
                         downloaded.append(fileURL)
                         await progress("Saved video \(relativeOutputPath(for: fileURL, outputDirectory: outputDirectory))")
                     case .skippedLarge:
@@ -1060,8 +1501,11 @@ public actor PortfolioScraperService {
                     case .downloaded(let image):
                         let fileURL: URL?
 
-                        if checkForDuplicates,
-                           let fingerprint = image.fingerprint {
+                        if let fingerprint = image.fingerprint {
+                            if savedImageRecords.contains(where: { $0.contentHash == image.contentHash }) {
+                                await progress("Skipped exact duplicate \(image.preferredName)")
+                                fileURL = nil
+                            } else {
                             let duplicateIndexes = savedImageRecords.indices.filter {
                                 isNearDuplicate(fingerprint, savedImageRecords[$0].fingerprint)
                             }
@@ -1069,29 +1513,30 @@ public actor PortfolioScraperService {
                             if duplicateIndexes.isEmpty {
                                 let savedURL = try persistImage(image, duplicateOutcome: "NOMATCH")
                                 downloaded.append(savedURL)
-                                savedImageRecords.append(SavedImageRecord(fileURL: savedURL, fingerprint: fingerprint))
+                                savedImageRecords.append(SavedImageRecord(fileURL: savedURL, contentHash: image.contentHash, fingerprint: fingerprint))
                                 fileURL = savedURL
                             } else if duplicateIndexes.contains(where: { savedImageRecords[$0].fingerprint.pixelArea >= fingerprint.pixelArea }) {
                                 fileURL = nil
                             } else {
                                 let duplicateURLs = Set(duplicateIndexes.map { savedImageRecords[$0].fileURL })
+                                // Save the better variant first so an interrupted replacement
+                                // can never erase the only archived copy.
+                                let replacementURL = try persistImage(image, duplicateOutcome: "REPLACE")
                                 for url in duplicateURLs where FileManager.default.fileExists(atPath: url.path) {
-                                    try FileManager.default.removeItem(at: url)
+                                    try? FileManager.default.removeItem(at: url)
                                 }
-
                                 downloaded.removeAll { duplicateURLs.contains($0) }
                                 savedImageRecords.removeAll { duplicateURLs.contains($0.fileURL) }
-
-                                let replacementURL = try persistImage(image, duplicateOutcome: "REPLACE")
                                 downloaded.append(replacementURL)
-                                savedImageRecords.append(SavedImageRecord(fileURL: replacementURL, fingerprint: fingerprint))
+                                savedImageRecords.append(SavedImageRecord(fileURL: replacementURL, contentHash: image.contentHash, fingerprint: fingerprint))
                                 fileURL = replacementURL
+                            }
                             }
                         } else {
                             let savedURL = try persistImage(image, duplicateOutcome: "NOMATCH")
                             downloaded.append(savedURL)
                             if let fingerprint = image.fingerprint {
-                                savedImageRecords.append(SavedImageRecord(fileURL: savedURL, fingerprint: fingerprint))
+                                savedImageRecords.append(SavedImageRecord(fileURL: savedURL, contentHash: image.contentHash, fingerprint: fingerprint))
                             }
                             fileURL = savedURL
                         }
@@ -1118,7 +1563,7 @@ public actor PortfolioScraperService {
     }
 
     private enum VideoDownloadResult {
-        case downloaded(URL)
+        case downloaded(DownloadedVideoPayload)
         case skippedLarge
     }
 
@@ -1132,6 +1577,9 @@ public actor PortfolioScraperService {
         let assetResponse = try await fetchAsset(for: candidate)
         let data = assetResponse.data
         guard !data.isEmpty else {
+            throw PortfolioScraperError.emptyAsset(url: candidate.url)
+        }
+        guard !isHTMLResponse(data: data, mimeType: assetResponse.mimeType) else {
             throw PortfolioScraperError.emptyAsset(url: candidate.url)
         }
         let mimeType = assetResponse.mimeType
@@ -1160,6 +1608,7 @@ public actor PortfolioScraperService {
                 preferredName: preferredName,
                 width: width,
                 height: height,
+                contentHash: contentHash(for: data),
                 fingerprint: fingerprint,
                 destinationDirectory: sourceDirectory(
                     for: candidate.referer,
@@ -1178,7 +1627,7 @@ public actor PortfolioScraperService {
     ) async throws -> VideoDownloadResult {
         try Task.checkCancellation()
         let headRequest = makeRequest(url: candidate.url, method: "HEAD", referer: candidate.referer)
-        if let (_, response) = try? await session.data(for: headRequest),
+        if let (_, response) = try? await dataWithTransientRetry(for: headRequest),
            let httpResponse = response as? HTTPURLResponse,
            let contentLength = httpResponse.value(forHTTPHeaderField: "Content-Length"),
            let length = Int(contentLength),
@@ -1191,32 +1640,34 @@ public actor PortfolioScraperService {
         guard !data.isEmpty else {
             throw PortfolioScraperError.emptyAsset(url: candidate.url)
         }
+        guard !isHTMLResponse(data: data, mimeType: assetResponse.mimeType) else {
+            throw PortfolioScraperError.emptyAsset(url: candidate.url)
+        }
 
         guard data.count <= maxVideoBytes else {
             return .skippedLarge
         }
 
-        let destinationDirectory = sourceDirectory(
-            for: candidate.referer,
-            in: outputDirectory,
-            organizeImagesBySourcePage: organizeImagesBySourcePage,
-            mediaKind: .video
+        return .downloaded(
+            DownloadedVideoPayload(
+                data: data,
+                preferredName: preferredFilename(for: candidate.url, mimeType: assetResponse.mimeType ?? "video/mp4", fallback: "video"),
+                contentHash: contentHash(for: data),
+                destinationDirectory: sourceDirectory(
+                    for: candidate.referer,
+                    in: outputDirectory,
+                    organizeImagesBySourcePage: organizeImagesBySourcePage,
+                    mediaKind: .video
+                )
+            )
         )
-        try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
-        let fileURL = try uniqueOutputURL(
-            in: destinationDirectory,
-            preferredName: preferredFilename(for: candidate.url, mimeType: assetResponse.mimeType ?? "video/mp4", fallback: "video")
-        )
-        try Task.checkCancellation()
-        try data.write(to: fileURL)
-        return .downloaded(fileURL)
     }
 
     private func fetchAsset(for candidate: AssetCandidate) async throws -> AssetResponse {
         let request = makeRequest(url: candidate.url, referer: candidate.referer)
 
         do {
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await dataWithTransientRetry(for: request)
             let httpResponse = try validateSuccessfulHTTP(response, fallbackURL: candidate.url)
             guard !data.isEmpty else {
                 throw PortfolioScraperError.emptyAsset(url: candidate.url)
@@ -1307,6 +1758,18 @@ public actor PortfolioScraperService {
             }
         }
 
+        if candidate.url.host?.lowercased() == "freight.cargo.site",
+           imageExtensions.contains(candidate.url.pathExtension.lowercased()) {
+            arguments.append(contentsOf: [
+                "-H", "Accept: image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "-H", "Accept-Language: en-GB,en-US;q=0.9,en;q=0.8",
+                "-H", "Sec-Fetch-Dest: image",
+                "-H", "Sec-Fetch-Mode: no-cors",
+                "-H", "Sec-Fetch-Site: cross-site",
+                "-H", "Priority: i"
+            ])
+        }
+
         arguments.append(candidate.url.absoluteString)
 
         let status = try await runCurl(arguments: arguments)
@@ -1328,23 +1791,74 @@ public actor PortfolioScraperService {
     }
 
     private func runCurl(arguments: [String]) async throws -> Int32 {
-        try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            process.arguments = arguments
+        final class ResumeBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var didResume = false
+            var callback: (@Sendable (Result<Int32, Error>) -> Void)?
 
-            let stderrPipe = Pipe()
-            process.standardError = stderrPipe
-
-            process.terminationHandler = { process in
-                continuation.resume(returning: process.terminationStatus)
+            func resume(_ result: Result<Int32, Error>) {
+                lock.lock()
+                guard !didResume else {
+                    lock.unlock()
+                    return
+                }
+                didResume = true
+                let callback = callback
+                lock.unlock()
+                callback?(result)
             }
+        }
 
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: error)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = arguments
+
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        let resumeBox = ResumeBox()
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                resumeBox.callback = { result in
+                    switch result {
+                    case .success(let status):
+                        continuation.resume(returning: status)
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
+                }
+
+                process.terminationHandler = { process in
+                    resumeBox.resume(.success(process.terminationStatus))
+                }
+
+                do {
+                    try process.run()
+                } catch {
+                    resumeBox.resume(.failure(error))
+                    return
+                }
+
+                Task {
+                    try? await Task.sleep(for: curlTimeout)
+                    if process.isRunning {
+                        process.terminate()
+                    }
+                    resumeBox.resume(
+                        .failure(
+                            PortfolioScraperError.timedOut(
+                                step: "curl download",
+                                seconds: Int(curlTimeout.components.seconds)
+                            )
+                        )
+                    )
+                }
             }
+        } onCancel: {
+            if process.isRunning {
+                process.terminate()
+            }
+            resumeBox.resume(.failure(CancellationError()))
         }
     }
 
@@ -1397,6 +1911,22 @@ public actor PortfolioScraperService {
         }
 
         return nil
+    }
+
+    private func contentHash(for data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func isHTMLResponse(data: Data, mimeType: String?) -> Bool {
+        if mimeType?.lowercased().contains("text/html") == true ||
+            mimeType?.lowercased().contains("application/xhtml") == true {
+            return true
+        }
+
+        let prefix = String(data: data.prefix(512), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        return prefix.hasPrefix("<!doctype html") || prefix.hasPrefix("<html")
     }
 
     private func isAVIF(url: URL, mimeType: String?) -> Bool {
@@ -1594,24 +2124,16 @@ public actor PortfolioScraperService {
     }
 
     private func isNearDuplicate(_ lhs: ImageFingerprint, _ rhs: ImageFingerprint) -> Bool {
-        let redHashThreshold = 12
-        let greenHashThreshold = 20
-        let blueHashThreshold = 10
-        let structureThreshold = 22
-        let colorThreshold = 66
-
-        let redDistance = hammingDistance(lhs.redHash, rhs.redHash)
-        let greenDistance = hammingDistance(lhs.greenHash, rhs.greenHash)
-        let blueDistance = hammingDistance(lhs.blueHash, rhs.blueHash)
-        if redDistance <= redHashThreshold &&
-            greenDistance <= greenHashThreshold &&
-            blueDistance <= blueHashThreshold {
-            return true
-        }
-
         let structureDistance = hammingDistance(lhs.structureHash, rhs.structureHash)
         let colorDistance = averageColorDistance(lhs.colorSignature, rhs.colorSignature)
-        return structureDistance <= structureThreshold && colorDistance <= colorThreshold
+        let aspectRatioDifference = abs(
+            (Double(lhs.width) / Double(max(lhs.height, 1))) -
+            (Double(rhs.width) / Double(max(rhs.height, 1)))
+        )
+
+        // Design work often deliberately reuses a layout with different colours. Only
+        // collapse near-identical rendered pixels, not images that merely share a form.
+        return structureDistance <= 7 && colorDistance <= 19 && aspectRatioDifference <= 0.01
     }
 
     private func hammingDistance(_ lhs: UInt64, _ rhs: UInt64) -> Int {
@@ -1724,13 +2246,12 @@ public actor PortfolioScraperService {
 
     private func filenameByAppendingDoneMarker(
         to preferredName: String,
-        checkForDuplicates: Bool,
         duplicateOutcome: String
     ) -> String {
         let fileURL = URL(fileURLWithPath: preferredName)
         let ext = fileURL.pathExtension
         let baseName = fileURL.deletingPathExtension().lastPathComponent
-        let marker = checkForDuplicates ? "DONE-CHECKON-\(duplicateOutcome)" : "DONE-CHECKOFF-\(duplicateOutcome)"
+        let marker = "DONE-CHECKON-\(duplicateOutcome)"
         if ext.isEmpty {
             return "\(baseName) \(marker)"
         }

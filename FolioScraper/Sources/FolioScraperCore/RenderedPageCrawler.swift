@@ -28,9 +28,16 @@ struct RenderedAssetResponse: Sendable {
 @MainActor
 final class RenderedPageCrawler: NSObject {
     private let viewportSize = CGSize(width: 1440, height: 2200)
+    private let navigationTimeout: Duration = .seconds(90)
+    private let scriptEvaluationTimeout: Duration = .seconds(90)
+    private let assetLoadTimeoutMilliseconds = 90_000
+    private let pageInspectionTimeout: TimeInterval = 90
+    private let stableScrollPasses = 3
+    private let maxScrollSteps = 120
     private var webView: WKWebView?
     private var hostWindow: NSWindow?
-    private var navigationContinuation: CheckedContinuation<Void, Error>?
+    private var navigationCompletion: ((Result<Void, Error>) -> Void)?
+    private var navigationTimeoutTask: Task<Void, Never>?
 
     static func capture(url: URL) async throws -> RenderedPageSnapshot {
         let crawler = RenderedPageCrawler()
@@ -48,12 +55,15 @@ final class RenderedPageCrawler: NSObject {
     }
 
     func snapshot(url: URL) async throws -> RenderedPageSnapshot {
+        let inspectionDeadline = Date().addingTimeInterval(pageInspectionTimeout)
         let webView = try prepareWebView()
-        try await load(url: url, in: webView)
-        try await settlePage(in: webView)
-        try? await autoScroll(in: webView)
-        try? await activateVideoContent(in: webView)
-        try? await autoScroll(in: webView)
+        try await load(url: url, in: webView, deadline: inspectionDeadline)
+        try await settlePage(in: webView, deadline: inspectionDeadline)
+        try? await autoScroll(in: webView, deadline: inspectionDeadline)
+        if Date() < inspectionDeadline {
+            try? await activateVideoContent(in: webView)
+            try? await autoScroll(in: webView, deadline: inspectionDeadline)
+        }
 
         let finalURL = webView.url ?? url
         let html = (try? await evaluateString(in: webView, script: Self.htmlSnapshotScript)) ?? ""
@@ -80,10 +90,14 @@ final class RenderedPageCrawler: NSObject {
         let script = """
         (async () => {
           try {
+            const controller = new AbortController();
+            const timeout = window.setTimeout(() => controller.abort(), \(assetLoadTimeoutMilliseconds));
             const response = await fetch(\(assetURLLiteral), {
+              signal: controller.signal,
               credentials: 'include',
               cache: 'no-store'
             });
+            window.clearTimeout(timeout);
             const contentType = response.headers.get('content-type') || '';
             if (!response.ok) {
               return {
@@ -163,7 +177,7 @@ final class RenderedPageCrawler: NSObject {
 
               const timer = window.setTimeout(() => {
                 finish({ error: 'Timed out while loading image resource' });
-              }, 30000);
+              }, \(assetLoadTimeoutMilliseconds));
 
               image.onload = () => {
                 try {
@@ -270,54 +284,107 @@ final class RenderedPageCrawler: NSObject {
         return webView
     }
 
-    private func load(url: URL, in webView: WKWebView) async throws {
+    private func load(url: URL, in webView: WKWebView, deadline: Date? = nil) async throws {
+        let remainingSeconds = deadline.map { Int($0.timeIntervalSinceNow.rounded(.down)) } ?? Int(navigationTimeout.components.seconds)
+        guard remainingSeconds > 0 else {
+            throw RenderedPageCrawlerError.stepFailed("page inspection", "Timed out before page navigation completed")
+        }
+        let timeoutSeconds = min(Int(navigationTimeout.components.seconds), remainingSeconds)
         let request = URLRequest(
             url: url,
             cachePolicy: .reloadIgnoringLocalCacheData,
-            timeoutInterval: 60
+            timeoutInterval: TimeInterval(timeoutSeconds)
         )
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            navigationContinuation = continuation
-            webView.load(request)
-        }
-    }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                var didComplete = false
 
-    private func settlePage(in webView: WKWebView) async throws {
-        try Task.checkCancellation()
-        try await Task.sleep(for: .milliseconds(900))
+                let complete: (Result<Void, Error>) -> Void = { [weak self, weak webView] result in
+                    guard !didComplete else { return }
+                    didComplete = true
+                    self?.navigationTimeoutTask?.cancel()
+                    self?.navigationTimeoutTask = nil
+                    self?.navigationCompletion = nil
+                    if case .failure = result {
+                        webView?.stopLoading()
+                    }
 
-        for _ in 0..<8 {
-            try Task.checkCancellation()
-            let readyState = try await evaluateString(in: webView, script: "document.readyState")
-            if readyState == "complete" {
-                break
+                    switch result {
+                    case .success:
+                        continuation.resume(returning: ())
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
+                }
+
+                navigationCompletion = complete
+                navigationTimeoutTask?.cancel()
+                let navigationTimeout = Duration.seconds(timeoutSeconds)
+                navigationTimeoutTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: navigationTimeout)
+                    self?.navigationCompletion?(
+                        .failure(
+                            RenderedPageCrawlerError.stepFailed(
+                                "page load",
+                                "Timed out after \(Self.secondsString(for: self?.navigationTimeout ?? .seconds(0)))"
+                            )
+                        )
+                    )
+                }
+                webView.load(request)
             }
-            try await Task.sleep(for: .milliseconds(250))
+        } onCancel: {
+            Task { @MainActor [weak self, weak webView] in
+                webView?.stopLoading()
+                self?.navigationCompletion?(.failure(CancellationError()))
+            }
         }
-
-        try await Task.sleep(for: .milliseconds(500))
     }
 
-    private func autoScroll(in webView: WKWebView) async throws {
-        let scrollMetrics = try await evaluateJSON(in: webView, script: Self.scrollMetricsScript)
-        let totalHeight = max((scrollMetrics["height"] as? Double) ?? 0, 0)
-        let viewportHeight = max((scrollMetrics["viewport"] as? Double) ?? 0, 0)
-        guard totalHeight > 0, viewportHeight > 0 else { return }
+    private func settlePage(in webView: WKWebView, deadline: Date? = nil) async throws {
+        try Task.checkCancellation()
+        let remainingSeconds = deadline.map { $0.timeIntervalSinceNow } ?? 3
+        guard remainingSeconds > 0 else {
+            throw RenderedPageCrawlerError.stepFailed("page inspection", "Timed out while waiting for page content")
+        }
+        // A committed document plus a short settling window is enough to collect useful
+        // media. Modern pages may keep background work alive forever after this point.
+        try await Task.sleep(for: .milliseconds(Int(min(remainingSeconds, 3) * 1_000)))
+    }
 
-        let step = max(viewportHeight * 0.75, 600)
-        let maxSteps = 18
+    private func autoScroll(in webView: WKWebView, deadline: Date) async throws {
         var position = 0.0
         var steps = 0
+        var stablePasses = 0
 
-        while position + viewportHeight < totalHeight, steps < maxSteps {
+        while Date() < deadline, steps < maxScrollSteps {
             try Task.checkCancellation()
-            position = min(position + step, totalHeight - viewportHeight)
+            let before = try await scrollMetrics(in: webView)
+            guard before.height > 0, before.viewport > 0 else { return }
+
+            let step = max(before.viewport * 0.75, 600)
+            let nextPosition = min(position + step, max(0, before.height - before.viewport))
             _ = try await evaluateJSON(
                 in: webView,
-                script: "window.scrollTo({ top: \(Int(position)), behavior: 'instant' }); ({ done: true })"
+                script: "window.scrollTo({ top: \(Int(nextPosition)), behavior: 'instant' }); ({ done: true })"
             )
-            try await Task.sleep(for: .milliseconds(350))
+            position = nextPosition
+            try await Task.sleep(for: .milliseconds(500))
+
+            let after = try await scrollMetrics(in: webView)
+            let gainedMedia = after.mediaCount > before.mediaCount
+            let grewPage = after.height > before.height + 1
+            let reachedBottom = position + after.viewport >= after.height - 1
+
+            if reachedBottom && !gainedMedia && !grewPage {
+                stablePasses += 1
+                if stablePasses >= stableScrollPasses {
+                    break
+                }
+            } else {
+                stablePasses = 0
+            }
             steps += 1
         }
 
@@ -328,35 +395,29 @@ final class RenderedPageCrawler: NSObject {
         try await Task.sleep(for: .milliseconds(250))
     }
 
+    private func scrollMetrics(in webView: WKWebView) async throws -> (height: Double, viewport: Double, mediaCount: Int) {
+        let metrics = try await evaluateJSON(in: webView, script: Self.scrollMetricsScript)
+        let height = max((metrics["height"] as? Double) ?? 0, 0)
+        let viewport = max((metrics["viewport"] as? Double) ?? 0, 0)
+        let mediaCount = (metrics["mediaCount"] as? Int) ?? (metrics["mediaCount"] as? NSNumber)?.intValue ?? 0
+        return (height, viewport, mediaCount)
+    }
+
     private func activateVideoContent(in webView: WKWebView) async throws {
         _ = try await evaluateJSON(in: webView, script: Self.videoActivationScript)
         try await Task.sleep(for: .milliseconds(900))
     }
 
     private func evaluateString(in webView: WKWebView, script: String) async throws -> String {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
-            webView.evaluateJavaScript(script) { result, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                continuation.resume(returning: result as? String ?? "")
-            }
+        try await evaluateJavaScript(in: webView, script: script, step: "page script") { result in
+            result as? String ?? ""
         }
     }
 
     private func evaluateJSON(in webView: WKWebView, script: String) async throws -> [String: Any] {
         let jsonScript = "JSON.stringify(\(script))"
-        let jsonString = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
-            webView.evaluateJavaScript(jsonScript) { result, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                continuation.resume(returning: result as? String ?? "{}")
-            }
+        let jsonString = try await evaluateJavaScript(in: webView, script: jsonScript, step: "page script") { result in
+            result as? String ?? "{}"
         }
 
         let data = Data(jsonString.utf8)
@@ -368,12 +429,58 @@ final class RenderedPageCrawler: NSObject {
         return payload
     }
 
+    private func evaluateJavaScript<T: Sendable>(
+        in webView: WKWebView,
+        script: String,
+        step: String,
+        transform: @escaping (Any?) -> T
+    ) async throws -> T {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+                var didComplete = false
+
+                let timeoutTask = Task { @MainActor in
+                    try? await Task.sleep(for: scriptEvaluationTimeout)
+                    guard !didComplete else { return }
+                    didComplete = true
+                    webView.stopLoading()
+                    continuation.resume(
+                        throwing: RenderedPageCrawlerError.stepFailed(
+                            step,
+                            "Timed out after \(Self.secondsString(for: scriptEvaluationTimeout))"
+                        )
+                    )
+                }
+
+                webView.evaluateJavaScript(script) { result, error in
+                    Task { @MainActor in
+                        guard !didComplete else { return }
+                        didComplete = true
+                        timeoutTask.cancel()
+
+                        if let error {
+                            continuation.resume(throwing: error)
+                            return
+                        }
+
+                        continuation.resume(returning: transform(result))
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                webView.stopLoading()
+            }
+        }
+    }
+
     private static let scrollMetricsScript = """
     (() => {
       const root = document.scrollingElement || document.documentElement || document.body;
       return {
         height: root ? Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0) : 0,
-        viewport: window.innerHeight || 0
+        viewport: window.innerHeight || 0,
+        mediaCount: document.querySelectorAll('img, source, video, [poster], [data-src], [data-srcset], [data-background], [data-bg]').length
       };
     })();
     """
@@ -521,6 +628,11 @@ final class RenderedPageCrawler: NSObject {
         return String(json.dropFirst().dropLast())
     }
 
+    private static func secondsString(for duration: Duration) -> String {
+        let seconds = duration.components.seconds
+        return "\(seconds) seconds"
+    }
+
     private func preferredCanvasMimeType(for url: URL) -> String {
         switch url.pathExtension.lowercased() {
         case "jpg", "jpeg":
@@ -532,24 +644,27 @@ final class RenderedPageCrawler: NSObject {
 }
 
 extension RenderedPageCrawler: WKNavigationDelegate {
+    nonisolated func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        Task { @MainActor in
+            navigationCompletion?(.success(()))
+        }
+    }
+
     nonisolated func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         Task { @MainActor in
-            navigationContinuation?.resume(returning: ())
-            navigationContinuation = nil
+            navigationCompletion?(.success(()))
         }
     }
 
     nonisolated func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         Task { @MainActor in
-            navigationContinuation?.resume(throwing: error)
-            navigationContinuation = nil
+            navigationCompletion?(.failure(error))
         }
     }
 
     nonisolated func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         Task { @MainActor in
-            navigationContinuation?.resume(throwing: error)
-            navigationContinuation = nil
+            navigationCompletion?(.failure(error))
         }
     }
 }

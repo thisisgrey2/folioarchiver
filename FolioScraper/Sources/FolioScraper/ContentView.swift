@@ -102,7 +102,7 @@ struct ContentView: View {
                 .toggleStyle(.checkbox)
                 .padding(.top, 10)
 
-            Toggle("Check for duplicates", isOn: $viewModel.checkForDuplicates)
+            Toggle("Download videos", isOn: $viewModel.downloadVideos)
                 .font(.system(size: 13))
                 .toggleStyle(.checkbox)
                 .padding(.top, 10)
