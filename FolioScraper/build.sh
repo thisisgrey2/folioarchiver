@@ -17,9 +17,6 @@ CLI_BINARY="$BUILD_PRODUCTS_DIR/$CLI_PRODUCT_NAME"
 CLI_BUNDLE_NAME="folioscraper-cli"
 CLI_GUIDE_NAME="FolioArchiver CLI.md"
 CLI_GUIDE_PATH="$ROOT_DIR/dist/$CLI_GUIDE_NAME"
-INSTALL_DIR="${INSTALL_DIR:-$HOME/Applications}"
-INSTALLED_APP="$INSTALL_DIR/$APP_NAME.app"
-INSTALLED_CLI_GUIDE="$INSTALL_DIR/$CLI_GUIDE_NAME"
 ICON_SOURCE="$ROOT_DIR/Assets/AppIcon.png"
 ICON_NAME="AppIcon"
 ICONSET_DIR="$ROOT_DIR/dist/$ICON_NAME.iconset"
@@ -69,7 +66,7 @@ FolioArchiver includes a bundled command-line tool for automated scraping.
 Run the bundled CLI directly from the app:
 
 \`\`\`bash
-"/Users/grey/Applications/$APP_NAME.app/Contents/MacOS/$CLI_BUNDLE_NAME" --help
+"$APP_BUNDLE/Contents/MacOS/$CLI_BUNDLE_NAME" --help
 \`\`\`
 
 ## Automatic terminal command
@@ -219,16 +216,10 @@ printf "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 sanitize_bundle_metadata "$APP_BUNDLE"
 codesign --force --deep --sign - "$APP_BUNDLE"
 
-mkdir -p "$INSTALL_DIR"
-rm -rf "$INSTALLED_APP"
-ditto "$APP_BUNDLE" "$INSTALLED_APP"
-cp "$CLI_GUIDE_PATH" "$INSTALLED_CLI_GUIDE"
-
 echo ""
 echo "Build complete."
 echo "App bundle: $APP_BUNDLE"
-echo "Installed to: $INSTALLED_APP"
 echo ""
 echo "Launch with:"
-echo "  open \"$INSTALLED_APP\""
+echo "  open \"$APP_BUNDLE\""
 echo ""
