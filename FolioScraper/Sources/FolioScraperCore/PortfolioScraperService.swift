@@ -61,11 +61,7 @@ private struct CargoCatalog {
 }
 
 private struct ImageFingerprint {
-    let structureHash: UInt64
     let colorSignature: [UInt8]
-    let redHash: UInt64
-    let greenHash: UInt64
-    let blueHash: UInt64
     let width: Int
     let height: Int
 
@@ -1441,20 +1437,12 @@ public actor PortfolioScraperService {
         var skippedLarge = 0
         var errors = 0
 
-        func persistImage(_ image: DownloadedImagePayload, duplicateOutcome: String) throws -> URL {
+        func persistImage(_ image: DownloadedImagePayload) throws -> URL {
             guard !image.data.isEmpty else {
                 throw PortfolioScraperError.emptyAsset(url: nil)
             }
             try FileManager.default.createDirectory(at: image.destinationDirectory, withIntermediateDirectories: true)
-            let preferredName = if image.fingerprint != nil {
-                filenameByAppendingDoneMarker(
-                    to: image.preferredName,
-                    duplicateOutcome: duplicateOutcome
-                )
-            } else {
-                image.preferredName
-            }
-            let fileURL = try uniqueOutputURL(in: image.destinationDirectory, preferredName: preferredName)
+            let fileURL = try uniqueOutputURL(in: image.destinationDirectory, preferredName: image.preferredName)
             try Task.checkCancellation()
             try image.data.write(to: fileURL)
             return fileURL
@@ -1511,7 +1499,7 @@ public actor PortfolioScraperService {
                             }
 
                             if duplicateIndexes.isEmpty {
-                                let savedURL = try persistImage(image, duplicateOutcome: "NOMATCH")
+                                let savedURL = try persistImage(image)
                                 downloaded.append(savedURL)
                                 savedImageRecords.append(SavedImageRecord(fileURL: savedURL, contentHash: image.contentHash, fingerprint: fingerprint))
                                 fileURL = savedURL
@@ -1521,7 +1509,7 @@ public actor PortfolioScraperService {
                                 let duplicateURLs = Set(duplicateIndexes.map { savedImageRecords[$0].fileURL })
                                 // Save the better variant first so an interrupted replacement
                                 // can never erase the only archived copy.
-                                let replacementURL = try persistImage(image, duplicateOutcome: "REPLACE")
+                                let replacementURL = try persistImage(image)
                                 for url in duplicateURLs where FileManager.default.fileExists(atPath: url.path) {
                                     try? FileManager.default.removeItem(at: url)
                                 }
@@ -1533,7 +1521,7 @@ public actor PortfolioScraperService {
                             }
                             }
                         } else {
-                            let savedURL = try persistImage(image, duplicateOutcome: "NOMATCH")
+                            let savedURL = try persistImage(image)
                             downloaded.append(savedURL)
                             if let fingerprint = image.fingerprint {
                                 savedImageRecords.append(SavedImageRecord(fileURL: savedURL, contentHash: image.contentHash, fingerprint: fingerprint))
@@ -1972,18 +1960,12 @@ public actor PortfolioScraperService {
 
     private func imageFingerprint(for image: CGImage) -> ImageFingerprint? {
         guard let normalizedImage = normalizedBitmapImage(from: image),
-              let structureHash = perceptualDifferenceHash(for: normalizedImage),
-              let colorHash = perceptualColorHash(for: normalizedImage),
-              let colorSignature = coarseColorSignature(for: normalizedImage) else {
+              let colorSignature = colorSignature(for: normalizedImage) else {
             return nil
         }
 
         return ImageFingerprint(
-            structureHash: structureHash,
             colorSignature: colorSignature,
-            redHash: colorHash.red,
-            greenHash: colorHash.green,
-            blueHash: colorHash.blue,
             width: normalizedImage.width,
             height: normalizedImage.height
         )
@@ -2031,45 +2013,8 @@ public actor PortfolioScraperService {
         return pixels
     }
 
-    private func perceptualDifferenceHash(for image: CGImage) -> UInt64? {
-        let width = 9
-        let height = 8
-
-        guard let pixels = sampledPixels(for: image, width: width, height: height) else {
-            return nil
-        }
-
-        var hash: UInt64 = 0
-        var bitIndex: UInt64 = 0
-
-        for row in 0..<height {
-            for column in 0..<(width - 1) {
-                let leftIndex = (row * width + column) * 4
-                let rightIndex = (row * width + column + 1) * 4
-
-                let left = luminance(
-                    red: pixels[leftIndex],
-                    green: pixels[leftIndex + 1],
-                    blue: pixels[leftIndex + 2]
-                )
-                let right = luminance(
-                    red: pixels[rightIndex],
-                    green: pixels[rightIndex + 1],
-                    blue: pixels[rightIndex + 2]
-                )
-
-                if left >= right {
-                    hash |= UInt64(1) << bitIndex
-                }
-                bitIndex += 1
-            }
-        }
-
-        return hash
-    }
-
-    private func coarseColorSignature(for image: CGImage) -> [UInt8]? {
-        let sampleSize = 4
+    private func colorSignature(for image: CGImage) -> [UInt8]? {
+        let sampleSize = 24
         guard let pixels = sampledPixels(for: image, width: sampleSize, height: sampleSize) else {
             return nil
         }
@@ -2086,58 +2031,9 @@ public actor PortfolioScraperService {
         return signature
     }
 
-    private func perceptualColorHash(for image: CGImage) -> (red: UInt64, green: UInt64, blue: UInt64)? {
-        let sampleSize = 8
-        guard let pixels = sampledPixels(for: image, width: sampleSize, height: sampleSize) else {
-            return nil
-        }
-
-        var redValues: [UInt8] = []
-        var greenValues: [UInt8] = []
-        var blueValues: [UInt8] = []
-        redValues.reserveCapacity(sampleSize * sampleSize)
-        greenValues.reserveCapacity(sampleSize * sampleSize)
-        blueValues.reserveCapacity(sampleSize * sampleSize)
-
-        for index in stride(from: 0, to: pixels.count, by: 4) {
-            redValues.append(pixels[index])
-            greenValues.append(pixels[index + 1])
-            blueValues.append(pixels[index + 2])
-        }
-
-        return (
-            channelHash(from: redValues),
-            channelHash(from: greenValues),
-            channelHash(from: blueValues)
-        )
-    }
-
-    private func channelHash(from values: [UInt8]) -> UInt64 {
-        let average = values.reduce(0) { $0 + Int($1) } / max(values.count, 1)
-        var hash: UInt64 = 0
-
-        for (index, value) in values.enumerated() where Int(value) >= average {
-            hash |= UInt64(1) << UInt64(index)
-        }
-
-        return hash
-    }
-
     private func isNearDuplicate(_ lhs: ImageFingerprint, _ rhs: ImageFingerprint) -> Bool {
-        let structureDistance = hammingDistance(lhs.structureHash, rhs.structureHash)
         let colorDistance = averageColorDistance(lhs.colorSignature, rhs.colorSignature)
-        let aspectRatioDifference = abs(
-            (Double(lhs.width) / Double(max(lhs.height, 1))) -
-            (Double(rhs.width) / Double(max(rhs.height, 1)))
-        )
-
-        // Design work often deliberately reuses a layout with different colours. Only
-        // collapse near-identical rendered pixels, not images that merely share a form.
-        return structureDistance <= 7 && colorDistance <= 19 && aspectRatioDifference <= 0.01
-    }
-
-    private func hammingDistance(_ lhs: UInt64, _ rhs: UInt64) -> Int {
-        Int((lhs ^ rhs).nonzeroBitCount)
+        return colorDistance <= 19
     }
 
     private func averageColorDistance(_ lhs: [UInt8], _ rhs: [UInt8]) -> Int {
@@ -2149,10 +2045,6 @@ public actor PortfolioScraperService {
             partial + abs(Int(pair.0) - Int(pair.1))
         }
         return totalDifference / lhs.count
-    }
-
-    private func luminance(red: UInt8, green: UInt8, blue: UInt8) -> Int {
-        (299 * Int(red) + 587 * Int(green) + 114 * Int(blue)) / 1000
     }
 
     private func preferredFilename(for url: URL, mimeType: String, fallback: String) -> String {
@@ -2242,20 +2134,6 @@ public actor PortfolioScraperService {
         let effectiveBase = cleanedBase.isEmpty ? fallbackBase : cleanedBase
         let truncatedBase = truncatedBaseName(effectiveBase, extensionLength: cleanedExtension.count, suffixLength: 0)
         return cleanedExtension.isEmpty ? truncatedBase : "\(truncatedBase).\(cleanedExtension)"
-    }
-
-    private func filenameByAppendingDoneMarker(
-        to preferredName: String,
-        duplicateOutcome: String
-    ) -> String {
-        let fileURL = URL(fileURLWithPath: preferredName)
-        let ext = fileURL.pathExtension
-        let baseName = fileURL.deletingPathExtension().lastPathComponent
-        let marker = "DONE-CHECKON-\(duplicateOutcome)"
-        if ext.isEmpty {
-            return "\(baseName) \(marker)"
-        }
-        return "\(baseName) \(marker).\(ext)"
     }
 
     private func sanitizeBaseName(_ value: String) -> String {
